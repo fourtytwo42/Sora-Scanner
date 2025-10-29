@@ -7,6 +7,7 @@ An automated data collection system for Sora-generated videos with PostgreSQL-po
 - 🔄 **Automated Scanning** - Continuous monitoring of Sora API for new posts
 - 🗄️ **PostgreSQL Backend** - Robust database with duplicate detection
 - 📊 **Performance Monitoring** - Real-time scanner statistics and error tracking
+- 📈 **Live Dashboard** - Built-in HTML dashboard with database health & scan history
 - 🔐 **Authentication Handling** - Automatic JWT token validation and error reporting
 - 🍪 **Automatic Cookie Management** - Refreshes Cloudflare cookies every 12 hours and on error detection
 - ⚡ **High Performance** - Optimized polling with dynamic timing adjustment
@@ -84,6 +85,8 @@ pm2 start ecosystem.config.js
 pm2 logs sora-feed-scanner
 ```
 
+Once the scanner is running you can open the live dashboard at `http://localhost:4000` (configurable via `STATS_PORT`/`STATS_HOST`).
+
 ## 📋 Available Commands
 
 | Command | Description |
@@ -93,6 +96,13 @@ pm2 logs sora-feed-scanner
 | `npm start` | Start scanner service (alias for scanner) |
 | `npm run refresh-cookies` | Refresh authentication cookies |
 | `npm run update-cookies` | Update cookies from browser |
+
+## 📈 Live Dashboard
+
+- Serves automatically from the scanner at `http://localhost:4000` (configurable with `STATS_HOST`/`STATS_PORT`)
+- Displays database totals, recent scan health, orientation distribution, and a rolling seven-day activity view
+- JSON stats also available at `/api/stats` for integrating with other tooling
+- Lightweight Node.js server with auto-refresh every 30 seconds
 
 ## 🗂️ Project Structure
 
@@ -104,11 +114,8 @@ soraFeed/
 │   └── utils/                # Utility scripts
 │       ├── refresh-cookies.js # Cookie refresh utility
 │       └── update-cookies.js  # Cookie update utility
+├── migrations/               # Database migrations
 ├── docs/                     # Documentation
-├── logs/                     # Scanner logs
-│   ├── scanner-error.log     # Error logs
-│   ├── scanner-out.log       # Output logs
-│   └── scanner-combined.log  # Combined logs
 ├── ecosystem.config.js       # PM2 configuration
 ├── .env                      # Environment variables
 └── package.json
@@ -156,10 +163,12 @@ soraFeed/
 | `DB_NAME` | Database name | sora_feed |
 | `DB_USER` | Database user | postgres |
 | `DB_PASSWORD` | Database password | postgres |
+| `STATS_PORT` | Port for the stats dashboard | 4000 |
+| `STATS_HOST` | Bind address for the stats dashboard | 0.0.0.0 |
 
 ### Scanner Settings
 
-Edit `scripts/scanner.js` to customize:
+Edit `src/scanner.js` to customize:
 - Scan frequency (default: 8-10 seconds, dynamic)
 - Posts per scan (default: 200)
 - API endpoint and parameters
@@ -191,9 +200,16 @@ Edit `scripts/scanner.js` to customize:
 - `indexed_at`, `last_updated` - Timestamps
 
 ### scanner_stats
-- Performance metrics and error tracking
-- Scan duration and success rates
-- Current scanner status and configuration
+- `total_scanned`, `new_posts`, `duplicate_posts`, `errors`
+- `last_scan_at`, `scan_duration_ms`, `current_poll_interval`
+- `last_overlap_pct`, `last_posts_per_second`, `last_new_posts`, `last_duplicates`
+- `consecutive_errors`, `last_error_at`, `scanner_started_at`
+
+### scanner_scan_history
+- `started_at`, `completed_at`, `duration_ms`
+- `fetch_count`, `new_posts`, `duplicate_posts`
+- `overlap_pct`, `posts_per_second`, `poll_interval_ms`
+- `status`, `error_message`
 
 ## 🐛 Troubleshooting
 

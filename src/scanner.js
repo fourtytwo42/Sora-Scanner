@@ -1,5 +1,6 @@
 const { Pool } = require('pg');
 const https = require('https');
+const http = require('http');
 require('dotenv').config();
 
 // Database connection
@@ -20,6 +21,13 @@ const MIN_POLL_INTERVAL = 6000;
 const MAX_POLL_INTERVAL = 30000;
 const BASE_POLL_INTERVAL = 10000;
 const TARGET_OVERLAP_PERCENTAGE = 30;
+const STATS_PORT = parseInt(process.env.STATS_PORT || '4000', 10);
+const STATS_HOST = process.env.STATS_HOST || '0.0.0.0';
+const DASHBOARD_CACHE_TTL = 5000;
+const numberFormatter = new Intl.NumberFormat('en-US');
+const percentFormatter = new Intl.NumberFormat('en-US', { minimumFractionDigits: 1, maximumFractionDigits: 1 });
+const decimalFormatter = new Intl.NumberFormat('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const dateTimeFormatter = new Intl.DateTimeFormat('en-US', { dateStyle: 'medium', timeStyle: 'medium' });
 
 // State
 let isScanning = false;
@@ -28,6 +36,8 @@ let lastScanPostIds = new Set();
 let consecutiveErrors = 0;
 let scanHistory = [];
 const MAX_HISTORY = 6;
+let statsServer;
+let dashboardCache = { timestamp: 0, data: null };
 
 // Calculate orientation from width/height
 function getOrientation(width, height) {
@@ -175,11 +185,12 @@ function adjustPollInterval(overlapPct) {
 }
 
 // Update statistics
-async function updateStats(stats, duration, error = null) {
+async function updateStats(stats, { duration, overlapPct = 0, postsPerSec = 0, pollInterval, error = null }) {
   try {
     const avgPostsPerSec = scanHistory.length > 0
       ? scanHistory.reduce((sum, h) => sum + h.postsPerSec, 0) / scanHistory.length
       : 0;
+    const hadError = Boolean(error);
 
     await pool.query(
       `UPDATE scanner_stats SET
@@ -193,23 +204,83 @@ async function updateStats(stats, duration, error = null) {
         error_message = $7,
         last_scan_count = $8,
         avg_posts_per_second = $9,
-        current_poll_interval = $10
+        current_poll_interval = $10,
+        last_overlap_pct = $11,
+        last_posts_per_second = $12,
+        last_new_posts = $13,
+        last_duplicates = $14,
+        consecutive_errors = $15,
+        last_error_at = CASE WHEN $4 > 0 THEN CURRENT_TIMESTAMP ELSE last_error_at END
       WHERE id = 1`,
       [
         stats.total || 0,
         stats.newPosts || 0,
         stats.duplicates || 0,
-        error ? 1 : 0,
+        hadError ? 1 : 0,
         duration,
-        error ? 'error' : 'success',
-        error?.message || null,
+        hadError ? 'error' : 'success',
+        hadError ? error.message : null,
         stats.total || 0,
-        avgPostsPerSec.toFixed(2),
-        scanInterval
+        Number(avgPostsPerSec.toFixed(2)),
+        pollInterval,
+        Number(overlapPct.toFixed(2)),
+        Number(postsPerSec.toFixed(2)),
+        stats.newPosts || 0,
+        stats.duplicates || 0,
+        consecutiveErrors
       ]
     );
   } catch (err) {
     console.error('Stats update failed:', err.message);
+  }
+}
+
+async function recordScanHistory({
+  startedAt,
+  completedAt,
+  duration,
+  fetchCount = 0,
+  newPosts = 0,
+  duplicatePosts = 0,
+  overlapPct = null,
+  postsPerSec = null,
+  pollInterval = null,
+  status = 'success',
+  error = null
+}) {
+  try {
+    await pool.query(
+      `INSERT INTO scanner_scan_history (
+        started_at,
+        completed_at,
+        duration_ms,
+        fetch_count,
+        new_posts,
+        duplicate_posts,
+        overlap_pct,
+        posts_per_second,
+        poll_interval_ms,
+        status,
+        error_message
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+      [
+        startedAt,
+        completedAt,
+        duration,
+        fetchCount,
+        newPosts,
+        duplicatePosts,
+        overlapPct,
+        postsPerSec,
+        pollInterval,
+        status,
+        error ? error.message : null
+      ]
+    );
+    // Bust dashboard cache so new data is rendered on next refresh
+    dashboardCache.timestamp = 0;
+  } catch (err) {
+    console.error('History insert failed:', err.message);
   }
 }
 
@@ -221,23 +292,28 @@ async function scanFeed() {
   }
 
   isScanning = true;
+  const startedAt = new Date();
   const start = Date.now();
+  let scanResult = { total: 0, newPosts: 0, duplicates: 0 };
+  let overlap = 0;
+  let postsPerSec = 0;
+  let fetchCount = 0;
   console.log(`\n🔍 [${new Date().toISOString()}] Scanning (limit: ${FETCH_LIMIT})...`);
 
   try {
-    await pool.query(`UPDATE scanner_stats SET status = 'scanning' WHERE id = 1`);
+    await pool.query(`UPDATE scanner_stats SET status = 'scanning', current_poll_interval = $1 WHERE id = 1`, [scanInterval]);
 
     const feedData = await fetchSoraFeed(FETCH_LIMIT);
-    const count = feedData.items?.length || 0;
-    console.log(`📥 Fetched ${count} posts`);
+    fetchCount = feedData.items?.length || 0;
+    console.log(`📥 Fetched ${fetchCount} posts`);
 
-    const result = await processPosts(feedData);
+    scanResult = await processPosts(feedData);
     const duration = Date.now() - start;
     
     // Calculate metrics
     const currentIds = new Set(feedData.items?.map(i => i.post.id) || []);
-    const overlap = calculateOverlap(currentIds);
-    const postsPerSec = count / (duration / 1000);
+    overlap = calculateOverlap(currentIds);
+    postsPerSec = duration > 0 ? fetchCount / (duration / 1000) : 0;
     
     // Update history
     scanHistory.push({ postsPerSec, timestamp: Date.now() });
@@ -246,27 +322,584 @@ async function scanFeed() {
     // Update for next scan
     lastScanPostIds = currentIds;
 
-    console.log(`✅ Complete: ${result.newPosts} new, ${result.duplicates} dup, ${overlap.toFixed(1)}% overlap, ${postsPerSec.toFixed(1)} posts/s, ${(duration/1000).toFixed(1)}s`);
+    console.log(`✅ Complete: ${scanResult.newPosts} new, ${scanResult.duplicates} dup, ${overlap.toFixed(1)}% overlap, ${postsPerSec.toFixed(1)} posts/s, ${(duration/1000).toFixed(1)}s`);
 
     // Adjust timing
     scanInterval = adjustPollInterval(overlap);
 
-    await updateStats(result, duration);
+    await updateStats(scanResult, {
+      duration,
+      overlapPct: overlap,
+      postsPerSec,
+      pollInterval: scanInterval
+    });
+
+    await recordScanHistory({
+      startedAt,
+      completedAt: new Date(),
+      duration,
+      fetchCount,
+      newPosts: scanResult.newPosts,
+      duplicatePosts: scanResult.duplicates,
+      overlapPct: Number(overlap.toFixed(2)),
+      postsPerSec: Number(postsPerSec.toFixed(2)),
+      pollInterval: scanInterval,
+      status: 'success'
+    });
+
     consecutiveErrors = 0;
 
   } catch (error) {
     const duration = Date.now() - start;
     console.error(`❌ Scan error: ${error.message}`);
-    await updateStats({}, duration, error);
-    
     consecutiveErrors++;
     if (consecutiveErrors >= 3) {
       scanInterval = Math.min(scanInterval * 2, MAX_POLL_INTERVAL);
       console.log(`🐌 Rate limiting: ${consecutiveErrors} errors, interval: ${scanInterval/1000}s`);
     }
+
+    await updateStats(scanResult, {
+      duration,
+      overlapPct: 0,
+      postsPerSec: 0,
+      pollInterval: scanInterval,
+      error
+    });
+
+    await recordScanHistory({
+      startedAt,
+      completedAt: new Date(),
+      duration,
+      fetchCount,
+      newPosts: scanResult.newPosts,
+      duplicatePosts: scanResult.duplicates,
+      overlapPct: Number.isFinite(overlap) ? Number(overlap.toFixed(2)) : 0,
+      postsPerSec: Number.isFinite(postsPerSec) ? Number(postsPerSec.toFixed(2)) : 0,
+      pollInterval: scanInterval,
+      status: 'error',
+      error
+    });
   } finally {
     isScanning = false;
   }
+}
+
+function formatNumberDisplay(value) {
+  if (value === null || value === undefined) return '0';
+  const num = Number(value);
+  if (!Number.isFinite(num)) return '0';
+  return numberFormatter.format(num);
+}
+
+function formatPercentDisplay(value) {
+  if (value === null || value === undefined) return '0%';
+  const num = Number(value);
+  if (!Number.isFinite(num)) return '0%';
+  return `${percentFormatter.format(num)}%`;
+}
+
+function formatInterval(ms) {
+  if (!Number.isFinite(ms) || ms <= 0) return '—';
+  if (ms < 1000) return `${Math.round(ms)} ms`;
+  const seconds = ms / 1000;
+  if (seconds < 60) return `${decimalFormatter.format(seconds)} s`;
+  const minutes = Math.floor(seconds / 60);
+  const remainingSeconds = seconds % 60;
+  return `${minutes}m ${Math.round(remainingSeconds)}s`;
+}
+
+function formatSecondsDisplay(seconds) {
+  if (!Number.isFinite(seconds) || seconds < 0) return '0.00 s';
+  return `${decimalFormatter.format(seconds)} s`;
+}
+
+function formatTimestamp(value) {
+  if (!value) return '—';
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) return '—';
+  return dateTimeFormatter.format(date);
+}
+
+function formatUptime(seconds) {
+  if (!Number.isFinite(seconds) || seconds <= 0) return '—';
+  const totalSeconds = Math.floor(seconds);
+  const days = Math.floor(totalSeconds / 86400);
+  const hours = Math.floor((totalSeconds % 86400) / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const parts = [];
+  if (days > 0) parts.push(`${days}d`);
+  if (hours > 0) parts.push(`${hours}h`);
+  if (minutes > 0) parts.push(`${minutes}m`);
+  const secs = totalSeconds % 60;
+  if (parts.length === 0 || secs > 0) parts.push(`${secs}s`);
+  return parts.join(' ');
+}
+
+function statusPillClass(status) {
+  switch (status) {
+    case 'success':
+      return 'success';
+    case 'scanning':
+      return 'scanning';
+    case 'error':
+      return 'error';
+    default:
+      return 'scanning';
+  }
+}
+
+async function fetchDashboardData() {
+  const now = Date.now();
+  if (dashboardCache.data && now - dashboardCache.timestamp < DASHBOARD_CACHE_TTL) {
+    return dashboardCache.data;
+  }
+
+  try {
+    const [
+      statsResult,
+      totalsResult,
+      orientationResult,
+      durationResult,
+      dailyResult,
+      recentScansResult,
+      recentTotalsResult
+    ] = await Promise.all([
+      pool.query(`
+        SELECT *,
+          EXTRACT(EPOCH FROM (NOW() - COALESCE(scanner_started_at, NOW())))::BIGINT AS uptime_seconds
+        FROM scanner_stats
+        WHERE id = 1
+      `),
+      pool.query(`
+        SELECT
+          COUNT(*)::BIGINT AS total_posts,
+          MAX(to_timestamp(posted_at)) AS latest_posted_at
+        FROM sora_posts
+      `),
+      pool.query(`
+        SELECT orientation, COUNT(*)::BIGINT AS count
+        FROM sora_posts
+        GROUP BY orientation
+        ORDER BY count DESC
+      `),
+      pool.query(`
+        SELECT
+          COALESCE(MIN(duration), 0)::NUMERIC(10,2) AS min_duration,
+          COALESCE(MAX(duration), 0)::NUMERIC(10,2) AS max_duration,
+          COALESCE(AVG(duration), 0)::NUMERIC(10,2) AS avg_duration
+        FROM sora_posts
+      `),
+      pool.query(`
+        SELECT
+          to_char(to_timestamp(posted_at), 'YYYY-MM-DD') AS day,
+          COUNT(*)::BIGINT AS posts
+        FROM sora_posts
+        WHERE to_timestamp(posted_at) >= NOW() - INTERVAL '7 days'
+        GROUP BY day
+        ORDER BY day DESC
+      `),
+      pool.query(`
+        SELECT
+          started_at,
+          completed_at,
+          duration_ms,
+          fetch_count,
+          new_posts,
+          duplicate_posts,
+          overlap_pct,
+          posts_per_second,
+          poll_interval_ms,
+          status,
+          error_message
+        FROM scanner_scan_history
+        ORDER BY started_at DESC
+        LIMIT 15
+      `),
+      pool.query(`
+        SELECT
+          COUNT(*) FILTER (WHERE to_timestamp(posted_at) >= NOW() - INTERVAL '1 hour')::BIGINT AS last_hour,
+          COUNT(*) FILTER (WHERE to_timestamp(posted_at) >= NOW() - INTERVAL '24 hours')::BIGINT AS last_24h
+        FROM sora_posts
+      `)
+    ]);
+
+    const stats = statsResult.rows[0] || {};
+    const totals = totalsResult.rows[0] || { total_posts: 0, latest_posted_at: null };
+    const orientation = orientationResult.rows || [];
+    const durations = durationResult.rows[0] || { min_duration: 0, max_duration: 0, avg_duration: 0 };
+    const daily = dailyResult.rows || [];
+    const recentScans = recentScansResult.rows || [];
+    const recentTotals = recentTotalsResult.rows[0] || { last_hour: 0, last_24h: 0 };
+
+    const data = {
+      stats,
+      totals,
+      orientation,
+      durations,
+      daily,
+      recentScans,
+      recentTotals,
+      generatedAt: new Date()
+    };
+
+    dashboardCache = { timestamp: now, data };
+    return data;
+  } catch (error) {
+    console.error('Dashboard data fetch failed:', error.message);
+    throw error;
+  }
+}
+
+function renderDashboardHTML(data) {
+  const {
+    stats = {},
+    totals = {},
+    orientation = [],
+    durations = {},
+    daily = [],
+    recentScans = [],
+    recentTotals = {},
+    generatedAt = new Date()
+  } = data;
+
+  const status = stats.status || 'idle';
+  const badgeClass = status === 'error' ? 'danger' : status === 'scanning' ? 'warn' : 'okay';
+  const totalPosts = Number(totals.total_posts || 0);
+  const lastHour = Number(recentTotals.last_hour || 0);
+  const last24h = Number(recentTotals.last_24h || 0);
+
+  const orientationMarkup = orientation.length > 0
+    ? orientation.map(item => {
+        const count = Number(item.count);
+        const percent = totalPosts > 0 ? (count / totalPosts) * 100 : 0;
+        return `
+          <div class="orientation-row">
+            <span class="label">${item.orientation}</span>
+            <div class="bar">
+              <span class="fill" style="width: ${Math.min(percent, 100).toFixed(1)}%;"></span>
+            </div>
+            <span class="value">${formatNumberDisplay(count)} (${formatPercentDisplay(percent)})</span>
+          </div>
+        `;
+      }).join('')
+    : '<p class="muted">No orientation data yet.</p>';
+
+  const dailyMarkup = daily.length > 0
+    ? `<div class="daily-grid">
+        ${daily.map(item => `
+          <div class="daily-card">
+            <div class="day">${item.day}</div>
+            <div class="count">${formatNumberDisplay(item.posts)}</div>
+          </div>
+        `).join('')}
+      </div>`
+    : '<p class="muted">Waiting for enough data to build the 7 day trend.</p>';
+
+  const recentRows = recentScans.length > 0
+    ? recentScans.map(scan => `
+        <tr>
+          <td>${formatTimestamp(scan.started_at)}</td>
+          <td>${formatInterval(scan.duration_ms)}</td>
+          <td>${formatNumberDisplay(scan.fetch_count)}</td>
+          <td>${formatNumberDisplay(scan.new_posts)}</td>
+          <td>${formatNumberDisplay(scan.duplicate_posts)}</td>
+          <td>${formatPercentDisplay(scan.overlap_pct || 0)}</td>
+          <td>${decimalFormatter.format(Number(scan.posts_per_second || 0))} /s</td>
+          <td>${formatInterval(scan.poll_interval_ms)}</td>
+          <td>
+            <span class="status-pill ${statusPillClass(scan.status)}">
+              ${scan.status}
+            </span>
+          </td>
+          <td class="muted">${scan.error_message ? scan.error_message : ''}</td>
+        </tr>
+      `).join('')
+    : `<tr><td colspan="10" class="muted">No scans recorded yet.</td></tr>`;
+
+  return `<!DOCTYPE html>
+  <html lang="en">
+    <head>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <meta http-equiv="refresh" content="30">
+      <title>Sora Scanner Dashboard</title>
+      <style>
+        :root { color-scheme: dark; font-family: 'Inter', system-ui, sans-serif; }
+        body {
+          margin: 0;
+          background: radial-gradient(circle at top, #0b1220, #05070c 55%);
+          color: #f1f5f9;
+          min-height: 100vh;
+          padding: 2.5rem 1.5rem 3rem;
+        }
+        main { max-width: 1180px; margin: 0 auto; }
+        header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 1rem; justify-content: space-between; margin-bottom: 2rem; }
+        h1 { margin: 0; font-size: 2rem; letter-spacing: -0.01em; }
+        .subtitle { color: rgba(255,255,255,0.55); font-size: 0.95rem; }
+        .badge {
+          display: inline-flex;
+          align-items: center;
+          gap: 0.4rem;
+          border-radius: 999px;
+          padding: 0.45rem 0.9rem;
+          font-size: 0.75rem;
+          text-transform: uppercase;
+          letter-spacing: 0.12em;
+          font-weight: 600;
+        }
+        .badge.okay { background: rgba(40,167,69,0.15); color: #8dffbd; }
+        .badge.warn { background: rgba(255,193,7,0.15); color: #ffe08a; }
+        .badge.danger { background: rgba(220,53,69,0.18); color: #ff9aa8; }
+        .grid {
+          display: grid;
+          gap: 1.2rem;
+          grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+          margin-bottom: 2rem;
+        }
+        .card {
+          background: rgba(15,23,42,0.82);
+          border: 1px solid rgba(148,163,184,0.12);
+          border-radius: 18px;
+          padding: 1.4rem;
+          backdrop-filter: blur(20px);
+          box-shadow: 0 12px 40px -24px rgba(15,23,42,0.9);
+        }
+        .card h2 {
+          margin: 0 0 0.9rem;
+          font-size: 1rem;
+          color: rgba(226,232,240,0.9);
+          text-transform: uppercase;
+          letter-spacing: 0.08em;
+        }
+        .metric { font-size: 2rem; font-weight: 600; margin-bottom: 0.25rem; }
+        .hint { color: rgba(226,232,240,0.65); font-size: 0.85rem; }
+        .section { margin-bottom: 2.5rem; }
+        .section-title {
+          margin: 0 0 1rem;
+          font-size: 1.1rem;
+          font-weight: 600;
+          text-transform: uppercase;
+          letter-spacing: 0.08em;
+          color: rgba(226,232,240,0.7);
+        }
+        .subgrid {
+          display: grid;
+          gap: 1.2rem;
+          grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+        }
+        .orientation-row {
+          display: grid;
+          grid-template-columns: auto 1fr auto;
+          gap: 0.75rem;
+          align-items: center;
+          margin-bottom: 0.8rem;
+        }
+        .orientation-row .label { text-transform: capitalize; font-weight: 500; color: rgba(226,232,240,0.8); }
+        .orientation-row .bar {
+          position: relative;
+          height: 9px;
+          background: rgba(148,163,184,0.18);
+          border-radius: 999px;
+          overflow: hidden;
+        }
+        .orientation-row .fill {
+          position: absolute;
+          inset: 0;
+          background: linear-gradient(90deg, #38bdf8, #a855f7);
+        }
+        .orientation-row .value { font-variant-numeric: tabular-nums; color: rgba(226,232,240,0.75); font-size: 0.85rem; }
+        .table-wrapper { overflow-x: auto; border-radius: 14px; border: 1px solid rgba(148,163,184,0.14); margin-top: 1rem; }
+        table { width: 100%; border-collapse: collapse; min-width: 720px; }
+        th, td { padding: 0.75rem 1rem; text-align: left; font-variant-numeric: tabular-nums; }
+        th {
+          background: rgba(15,23,42,0.6);
+          color: rgba(148,163,184,0.7);
+          font-size: 0.7rem;
+          letter-spacing: 0.12em;
+          text-transform: uppercase;
+        }
+        td { border-top: 1px solid rgba(148,163,184,0.08); color: rgba(226,232,240,0.92); }
+        tr:hover td { background: rgba(59,130,246,0.08); }
+        .status-pill {
+          display: inline-flex;
+          align-items: center;
+          padding: 0.25rem 0.65rem;
+          border-radius: 999px;
+          font-size: 0.75rem;
+          font-weight: 600;
+          text-transform: capitalize;
+        }
+        .status-pill.success { background: rgba(34,197,94,0.15); color: #bbf7d0; }
+        .status-pill.error { background: rgba(239,68,68,0.15); color: #fecaca; }
+        .status-pill.scanning { background: rgba(59,130,246,0.18); color: #bfdbfe; }
+        .muted { color: rgba(148,163,184,0.65); }
+        .daily-grid { display: grid; gap: 0.9rem; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); }
+        .daily-card {
+          background: rgba(15,23,42,0.68);
+          border-radius: 12px;
+          padding: 0.85rem;
+          border: 1px solid rgba(148,163,184,0.1);
+        }
+        .daily-card .day { font-size: 0.85rem; color: rgba(226,232,240,0.75); }
+        .daily-card .count { font-size: 1.3rem; font-weight: 600; }
+        footer { margin-top: 2rem; text-align: center; color: rgba(148,163,184,0.6); font-size: 0.8rem; }
+        @media (max-width: 720px) {
+          header { flex-direction: column; align-items: flex-start; }
+          body { padding: 1.5rem 1rem 2rem; }
+          .grid { grid-template-columns: 1fr; }
+        }
+      </style>
+    </head>
+    <body>
+      <main>
+        <header>
+          <div>
+            <h1>Sora Scanner Dashboard</h1>
+            <div class="subtitle">Database health &amp; ingestion performance</div>
+          </div>
+          <div class="badge ${badgeClass}">
+            ${status}
+          </div>
+        </header>
+
+        <section class="grid">
+          <div class="card">
+            <h2>Total Posts Indexed</h2>
+            <div class="metric">${formatNumberDisplay(totalPosts)}</div>
+            <div class="hint">+${formatNumberDisplay(last24h)} in the last 24h • +${formatNumberDisplay(lastHour)} in the past hour</div>
+          </div>
+          <div class="card">
+            <h2>Average Throughput</h2>
+            <div class="metric">${decimalFormatter.format(Number(stats.avg_posts_per_second || 0))} /s</div>
+            <div class="hint">Last scan: ${decimalFormatter.format(Number(stats.last_posts_per_second || 0))} /s (${formatPercentDisplay(stats.last_overlap_pct || 0)} overlap)</div>
+          </div>
+          <div class="card">
+            <h2>Polling Interval</h2>
+            <div class="metric">${formatInterval(stats.current_poll_interval)}</div>
+            <div class="hint">Target overlap ${TARGET_OVERLAP_PERCENTAGE}% • Consecutive errors: ${formatNumberDisplay(stats.consecutive_errors || 0)}</div>
+          </div>
+          <div class="card">
+            <h2>Uptime &amp; Last Scan</h2>
+            <div class="metric">${formatUptime(Number(stats.uptime_seconds || 0))}</div>
+            <div class="hint">Last scan: ${formatTimestamp(stats.last_scan_at)}</div>
+          </div>
+        </section>
+
+        <section class="section">
+          <h2 class="section-title">Scanner Health</h2>
+          <div class="subgrid">
+            <div class="card">
+              <h2>Latest Activity</h2>
+              <div class="hint">New posts: ${formatNumberDisplay(stats.last_new_posts || 0)}</div>
+              <div class="hint">Duplicates: ${formatNumberDisplay(stats.last_duplicates || 0)}</div>
+              <div class="hint">Total scanned this pass: ${formatNumberDisplay(stats.last_scan_count || 0)}</div>
+            </div>
+            <div class="card">
+              <h2>Error Tracking</h2>
+              <div class="hint">Total errors: ${formatNumberDisplay(stats.errors || 0)}</div>
+              <div class="hint">Last error: ${formatTimestamp(stats.last_error_at)}</div>
+              <div class="hint">${stats.error_message ? `Last message: ${stats.error_message}` : 'No recent errors 🎉'}</div>
+            </div>
+            <div class="card">
+              <h2>Video Duration (s)</h2>
+              <div class="hint">Avg: ${formatSecondsDisplay(durations.avg_duration || 0)}</div>
+              <div class="hint">Min: ${formatSecondsDisplay(durations.min_duration || 0)} • Max: ${formatSecondsDisplay(durations.max_duration || 0)}</div>
+              <div class="hint">Latest post: ${formatTimestamp(totals.latest_posted_at)}</div>
+            </div>
+          </div>
+        </section>
+
+        <section class="section">
+          <h2 class="section-title">Orientation Distribution</h2>
+          <div class="card">
+            ${orientationMarkup}
+          </div>
+        </section>
+
+        <section class="section">
+          <h2 class="section-title">Activity (Last 7 Days)</h2>
+          <div class="card">
+            ${dailyMarkup}
+          </div>
+        </section>
+
+        <section class="section">
+          <h2 class="section-title">Recent Scans</h2>
+          <div class="table-wrapper">
+            <table>
+              <thead>
+                <tr>
+                  <th>Started</th>
+                  <th>Duration</th>
+                  <th>Fetched</th>
+                  <th>New</th>
+                  <th>Duplicates</th>
+                  <th>Overlap</th>
+                  <th>Speed</th>
+                  <th>Next Poll</th>
+                  <th>Status</th>
+                  <th>Error</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${recentRows}
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <footer>
+          Updated ${formatTimestamp(generatedAt)} • Auto refresh every 30s • API limit ${FETCH_LIMIT} posts/scan
+        </footer>
+      </main>
+    </body>
+  </html>`;
+}
+
+function startStatsServer() {
+  const server = http.createServer(async (req, res) => {
+    const hostHeader = req.headers.host || `${STATS_HOST}:${STATS_PORT}`;
+    const requestUrl = new URL(req.url, `http://${hostHeader}`);
+
+    try {
+      if (requestUrl.pathname === '/health') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ status: 'ok', timestamp: new Date().toISOString() }));
+        return;
+      }
+
+      if (requestUrl.pathname === '/api/stats') {
+        const data = await fetchDashboardData();
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(data));
+        return;
+      }
+
+      if (requestUrl.pathname === '/' || requestUrl.pathname === '/index.html') {
+        const data = await fetchDashboardData();
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(renderDashboardHTML(data));
+        return;
+      }
+
+      res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end('Not found');
+    } catch (error) {
+      console.error('Stats endpoint error:', error.message);
+      res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end('Internal Server Error');
+    }
+  });
+
+  server.listen(STATS_PORT, STATS_HOST, () => {
+    console.log(`📈 Stats dashboard available at http://${STATS_HOST}:${STATS_PORT}`);
+  });
+
+  server.on('error', (err) => {
+    console.error('Stats server error:', err.message);
+  });
+
+  return server;
 }
 
 // Schedule next scan
@@ -291,6 +924,18 @@ async function main() {
     console.log(`✅ PostgreSQL connected: ${version.rows[0].version.split(' ').slice(0, 2).join(' ')}`);
     client.release();
 
+    await pool.query(
+      `UPDATE scanner_stats
+       SET scanner_started_at = NOW(),
+           status = 'starting',
+           error_message = NULL,
+           current_poll_interval = $1
+       WHERE id = 1`,
+      [scanInterval]
+    );
+
+    statsServer = startStatsServer();
+
     // Initial scan
     await scanFeed();
 
@@ -307,18 +952,23 @@ async function main() {
 // Graceful shutdown
 process.on('SIGINT', async () => {
   console.log('\n🛑 Shutting down...');
-  await pool.query(`UPDATE scanner_stats SET status = 'stopped' WHERE id = 1`);
+  if (statsServer) {
+    await new Promise(resolve => statsServer.close(resolve));
+  }
+  await pool.query(`UPDATE scanner_stats SET status = 'stopped', current_poll_interval = $1 WHERE id = 1`, [scanInterval]);
   await pool.end();
   process.exit(0);
 });
 
 process.on('SIGTERM', async () => {
   console.log('\n🛑 Shutting down...');
-  await pool.query(`UPDATE scanner_stats SET status = 'stopped' WHERE id = 1`);
+  if (statsServer) {
+    await new Promise(resolve => statsServer.close(resolve));
+  }
+  await pool.query(`UPDATE scanner_stats SET status = 'stopped', current_poll_interval = $1 WHERE id = 1`, [scanInterval]);
   await pool.end();
   process.exit(0);
 });
 
 // Start
 main();
-

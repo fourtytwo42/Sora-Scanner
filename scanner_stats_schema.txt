@@ -1,0 +1,24 @@
+      column_name      |          data_type          
+-----------------------+-----------------------------
+ id                    | integer
+ total_scanned         | integer
+ new_posts             | integer
+ duplicate_posts       | integer
+ errors                | integer
+ last_scan_at          | timestamp without time zone
+ scan_duration_ms      | integer
+ status                | text
+ error_message         | text
+ last_scan_count       | integer
+ avg_posts_per_second  | numeric
+ current_poll_interval | integer
+ scanner_started_at    | timestamp without time zone
+ last_error_at         | timestamp without time zone
+ last_overlap_pct      | numeric
+ last_posts_per_second | numeric
+ last_new_posts        | integer
+ last_duplicate_posts  | integer
+ last_duplicates       | integer
+ consecutive_errors    | integer
+(20 rows)
+

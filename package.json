@@ -7,12 +7,14 @@
     "scanner": "node src/scanner.js",
     "refresh-cookies": "node src/utils/refresh-cookies.js",
     "update-cookies": "node src/utils/update-cookies.js",
+    "refresh-token": "node refresh-token-browser.js",
     "setup": "node src/setup.cjs",
     "start": "node src/scanner.js"
   },
   "dependencies": {
     "dotenv": "^17.2.3",
-    "pg": "^8.12.0"
+    "pg": "^8.12.0",
+    "puppeteer": "^24.26.1"
   },
   "devDependencies": {
     "@types/node": "^20",

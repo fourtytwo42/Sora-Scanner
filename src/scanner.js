@@ -502,8 +502,9 @@ function formatInterval(ms) {
 }
 
 function formatSecondsDisplay(seconds) {
-  if (!Number.isFinite(seconds) || seconds < 0) return '0.00 s';
-  return `${decimalFormatter.format(seconds)} s`;
+  const num = Number(seconds);
+  if (!Number.isFinite(num) || num < 0) return '0.00 s';
+  return `${decimalFormatter.format(num)} s`;
 }
 
 function formatTimestamp(value) {

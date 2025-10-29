@@ -625,9 +625,33 @@ async function fetchDashboardData() {
     const recentScans = recentScansResult.rows || [];
     const recentTotals = recentTotalsResult.rows[0] || { last_hour: 0, last_24h: 0 };
 
-    // Count valid tokens
+    // Count valid tokens from DB
     const tokensCountRes = await pool.query(`SELECT COUNT(*)::INT AS count FROM jwt_tokens WHERE expires_at > NOW()`);
     const tokensListRes = await pool.query(`SELECT id, expires_at, added_at FROM jwt_tokens ORDER BY expires_at DESC`);
+    
+    // Check if env token is valid and not expired
+    let envTokenCount = 0;
+    let envTokenInfo = null;
+    if (process.env.AUTH_BEARER_TOKEN) {
+      const exp = parseJwtExp(process.env.AUTH_BEARER_TOKEN);
+      if (exp && exp.getTime() > Date.now()) {
+        envTokenCount = 1;
+        // Check if env token already exists in DB
+        const envExistsRes = await pool.query(
+          `SELECT id FROM jwt_tokens WHERE token = $1`,
+          [process.env.AUTH_BEARER_TOKEN]
+        );
+        if (envExistsRes.rows.length === 0) {
+          // Token not in DB, show as env token
+          envTokenInfo = {
+            id: 'env',
+            expires_at: exp,
+            added_at: new Date(),
+            source: 'env'
+          };
+        }
+      }
+    }
 
     const data = {
       stats,
@@ -639,8 +663,8 @@ async function fetchDashboardData() {
       recentTotals,
       generatedAt: new Date(),
       jwt: {
-        count: tokensCountRes.rows[0]?.count || 0,
-        tokens: tokensListRes.rows
+        count: (tokensCountRes.rows[0]?.count || 0) + envTokenCount,
+        tokens: envTokenInfo ? [envTokenInfo, ...tokensListRes.rows] : tokensListRes.rows
       }
     };
 
@@ -671,20 +695,113 @@ function renderDashboardHTML(data) {
   const lastHour = Number(recentTotals.last_hour || 0);
   const last24h = Number(recentTotals.last_24h || 0);
 
+  // Calculate pie chart data
   const orientationMarkup = orientation.length > 0
-    ? orientation.map(item => {
-        const count = Number(item.count);
-        const percent = totalPosts > 0 ? (count / totalPosts) * 100 : 0;
+    ? (() => {
+        const items = orientation.map(item => {
+          const count = Number(item.count);
+          const percent = totalPosts > 0 ? (count / totalPosts) * 100 : 0;
+          return { orientation: item.orientation, count, percent };
+        });
+        
+        // Calculate SVG path for pie chart with labels
+        let currentAngle = -90; // Start at top
+        const radius = 100;
+        const svgSize = 320;
+        const center = svgSize / 2;
+        const colors = {
+          wide: '#38bdf8',
+          tall: '#a855f7',
+          square: '#10b981'
+        };
+        
+        const svgElements = items.map(item => {
+          const angle = (item.percent / 100) * 360;
+          const startAngle = currentAngle;
+          const midAngle = startAngle + angle / 2;
+          const endAngle = currentAngle + angle;
+          
+          // Calculate start point
+          const x1 = center + radius * Math.cos(startAngle * Math.PI / 180);
+          const y1 = center + radius * Math.sin(startAngle * Math.PI / 180);
+          
+          // Calculate end point
+          const x2 = center + radius * Math.cos(endAngle * Math.PI / 180);
+          const y2 = center + radius * Math.sin(endAngle * Math.PI / 180);
+          
+          const largeArcFlag = angle > 180 ? 1 : 0;
+          
+          // Decide if label should be inside or outside based on angle size
+          // Large slices (>10%) get inside labels, smaller ones get outside
+          const useInsideLabel = angle > 36; // 10% of 360 degrees
+          
+          // Calculate label position
+          const labelRadius = useInsideLabel ? radius * 0.6 : radius + 40;
+          const labelX = center + labelRadius * Math.cos(midAngle * Math.PI / 180);
+          const labelY = center + labelRadius * Math.sin(midAngle * Math.PI / 180);
+          
+          // Calculate line start point (on the edge of the slice, only for outside labels)
+          const lineStartX = useInsideLabel ? 0 : center + (radius + 10) * Math.cos(midAngle * Math.PI / 180);
+          const lineStartY = useInsideLabel ? 0 : center + (radius + 10) * Math.sin(midAngle * Math.PI / 180);
+          
+          currentAngle += angle;
+          
+          return {
+            path: `M ${center} ${center} L ${x1} ${y1} A ${radius} ${radius} 0 ${largeArcFlag} 1 ${x2} ${y2} Z`,
+            color: colors[item.orientation] || '#64748b',
+            label: item.orientation,
+            count: item.count,
+            percent: item.percent,
+            labelX,
+            labelY,
+            lineStartX,
+            lineStartY,
+            useInsideLabel
+          };
+        });
+        
         return `
-          <div class="orientation-row">
-            <span class="label">${item.orientation}</span>
-            <div class="bar">
-              <span class="fill" style="width: ${Math.min(percent, 100).toFixed(1)}%;"></span>
-            </div>
-            <span class="value">${formatNumberDisplay(count)} (${formatPercentDisplay(percent)})</span>
+          <div style="display:flex;justify-content:center;align-items:center;">
+            <svg width="${svgSize}" height="${svgSize}" viewBox="0 0 ${svgSize} ${svgSize}">
+              ${svgElements.map(e => `<path d="${e.path}" fill="${e.color}" stroke="rgba(15,23,42,0.8)" stroke-width="2" style="cursor:pointer;transition:opacity 0.2s;" onmouseover="this.style.opacity='0.8'" onmouseout="this.style.opacity='1'"/>`).join('')}
+              ${svgElements.map(e => `
+                <g>
+                  ${e.useInsideLabel ? '' : `<line x1="${e.lineStartX}" 
+                        y1="${e.lineStartY}" 
+                        x2="${e.labelX}" 
+                        y2="${e.labelY}" 
+                        stroke="${e.color}" 
+                        stroke-width="2" 
+                        opacity="0.6"/>`}
+                  <text x="${e.labelX}" 
+                        y="${e.labelY - 15}" 
+                        text-anchor="middle" 
+                        fill="${e.useInsideLabel ? '#f1f5f9' : e.color}" 
+                        font-size="14" 
+                        font-weight="600" 
+                        text-transform="capitalize">
+                    ${e.label}
+                  </text>
+                  <text x="${e.labelX}" 
+                        y="${e.labelY}" 
+                        text-anchor="middle" 
+                        fill="${e.useInsideLabel ? '#f1f5f9' : '#f1f5f9'}" 
+                        font-size="12">
+                    ${formatNumberDisplay(e.count)}
+                  </text>
+                  <text x="${e.labelX}" 
+                        y="${e.labelY + 15}" 
+                        text-anchor="middle" 
+                        fill="${e.useInsideLabel ? 'rgba(226,232,240,0.85)' : 'rgba(226,232,240,0.75)'}" 
+                        font-size="11">
+                    ${formatPercentDisplay(e.percent)}
+                  </text>
+                </g>
+              `).join('')}
+            </svg>
           </div>
         `;
-      }).join('')
+      })()
     : '<p class="muted">No orientation data yet.</p>';
 
   const dailyMarkup = daily.length > 0
@@ -850,6 +967,10 @@ function renderDashboardHTML(data) {
           header { flex-direction: column; align-items: flex-start; }
           body { padding: 1.5rem 1rem 2rem; }
           .grid { grid-template-columns: 1fr; }
+          div[style*="display:grid"][style*="grid-template-columns:auto 1fr"] {
+            grid-template-columns: 1fr !important;
+            justify-items: center;
+          }
         }
       </style>
     </head>
@@ -867,6 +988,8 @@ function renderDashboardHTML(data) {
 
         ${jwt.count === 0 ? `<div style="background:#5a0000;border:1px solid #ff6b6b;color:#ffdede;padding:12px 16px;border-radius:10px;margin:0 0 16px;">
           <strong>No valid JWT tokens.</strong> Add a token below to resume scanning.
+        </div>` : jwt.count > 0 ? `<div style="background:rgba(40,167,69,0.15);border:1px solid rgba(40,167,69,0.4);color:#8dffbd;padding:12px 16px;border-radius:10px;margin:0 0 16px;">
+          <strong>✅ ${jwt.count} valid JWT token${jwt.count > 1 ? 's' : ''} active.</strong> ${jwt.count > 1 ? 'Scanner is using the best available token.' : 'Scanner is using this token.'}
         </div>` : ''}
 
         <section class="grid">
@@ -975,12 +1098,12 @@ function renderDashboardHTML(data) {
                 </thead>
                 <tbody id="tokensBody">
                   ${jwt.tokens.length > 0 ? jwt.tokens.map(t => `
-                    <tr>
-                      <td>${t.id}</td>
+                    <tr ${t.source === 'env' ? 'style="background:rgba(59,130,246,0.08);"' : ''}>
+                      <td>${t.id === 'env' ? '<span style="color:#38bdf8;font-weight:600;">ENV</span>' : t.id}</td>
                       <td>${formatTimestamp(t.expires_at)}</td>
-                      <td>${formatTimestamp(t.added_at)}</td>
+                      <td>${t.source === 'env' ? '<span class="muted">Environment Variable</span>' : formatTimestamp(t.added_at)}</td>
                       <td>
-                        <button onclick="deleteToken(${t.id})" style="padding:6px 10px;border-radius:8px;border:1px solid rgba(148,163,184,0.3);background:rgba(239,68,68,0.25);color:#fecaca;cursor:pointer;">Remove</button>
+                        ${t.source === 'env' ? '<span style="padding:6px 10px;border-radius:8px;background:rgba(59,130,246,0.25);color:#93c5fd;font-size:0.85rem;">Active</span>' : `<button onclick="deleteToken(${t.id})" style="padding:6px 10px;border-radius:8px;border:1px solid rgba(148,163,184,0.3);background:rgba(239,68,68,0.25);color:#fecaca;cursor:pointer;">Remove</button>`}
                       </td>
                     </tr>
                   `).join('') : `<tr><td colspan="4" class="muted">No tokens yet.</td></tr>`}

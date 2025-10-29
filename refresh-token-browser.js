@@ -38,7 +38,7 @@ const ARG_SET = new Set(process.argv.slice(2));
 const SHOULD_UPDATE_ENV = ARG_SET.has('--update-env');
 const SHOW_BROWSER = ARG_SET.has('--show') || ARG_SET.has('--no-headless');
 const FORCE_HEADLESS = ARG_SET.has('--headless');
-const DEBUG_LOG = ARG_SET.has('--debug');
+const DEBUG_LOG = ARG_SET.has('--debug') || true; // Enable debug by default
 
 const HEADLESS_MODE = SHOW_BROWSER ? false : (FORCE_HEADLESS ? 'new' : 'new');
 const LOGIN_TIMEOUT = 120_000;
@@ -249,83 +249,136 @@ async function loginAndGetToken() {
       'Accept-Language': process.env.ACCEPT_LANGUAGE || 'en-US,en;q=0.9'
     });
 
-    const authUrl = new URL('https://auth.openai.com/oauth/authorize');
-    authUrl.searchParams.set('audience', AUDIENCE);
-    authUrl.searchParams.set('client_id', CLIENT_ID);
-    authUrl.searchParams.set('redirect_uri', REDIRECT_URI);
-    authUrl.searchParams.set('response_type', 'code');
-    authUrl.searchParams.set('scope', SCOPE);
-    authUrl.searchParams.set('prompt', 'login');
-    authUrl.searchParams.set('screen_hint', 'login');
-    authUrl.searchParams.set('state', Math.random().toString(36).slice(2));
-    authUrl.searchParams.set('ext-oai-did', Math.random().toString(36).slice(2));
-    authUrl.searchParams.set('device_id', Math.random().toString(36).slice(2));
-    authUrl.searchParams.set('login_hint', PHONE_NUMBER);
-
-    console.log('🌐 Opening OpenAI login page...');
-    await page.goto(authUrl.toString(), { waitUntil: 'networkidle0', timeout: LOGIN_TIMEOUT });
+    // Go directly to the phone number login page
+    const phoneLoginUrl = 'https://auth.openai.com/log-in-or-create-account?usernameKind=phone_number';
+    
+    console.log('🌐 Opening OpenAI phone number login page...');
+    debug(`Navigating to: ${phoneLoginUrl}`);
+    await page.goto(phoneLoginUrl, { waitUntil: 'networkidle0', timeout: LOGIN_TIMEOUT });
     debug(`Initial page URL: ${page.url()}`);
+    debug(`Page title: ${await page.title()}`);
+    
+    // Wait for the page to be fully loaded and stable
+    await new Promise(resolve => setTimeout(resolve, 3000));
+    debug('Page should be stable now');
 
     // Some accounts land on ChatGPT directly if a valid session already exists.
     const initialHost = new URL(page.url()).hostname;
     if (!initialHost.endsWith('auth.openai.com')) {
       debug(`Already on ${page.url()}, skipping credential entry.`);
     } else {
-      console.log('📱 Entering username / phone number...');
+      console.log('📱 Entering phone number...');
+      debug('Looking for phone number input field...');
+      
+      // Wait for the page to be fully interactive
+      await page.waitForFunction(() => {
+        return document.readyState === 'complete' && 
+               !document.querySelector('[data-testid="loading"]') &&
+               !document.querySelector('.loading');
+      }, { timeout: 10000 });
+      
+      debug('Page is fully interactive, looking for input field...');
+      
       const usernameInput = await waitForAnySelector(page, [
         'input[name="username"]',
         'input[type="email"]',
         'input[type="text"]',
         'input[type="tel"]',
-        '#username'
+        '#username',
+        'input[placeholder*="phone"]',
+        'input[placeholder*="number"]'
       ], { visible: true, timeout: LOGIN_TIMEOUT });
 
-      await clearAndType(usernameInput, PHONE_NUMBER);
+      debug('Found phone number input field');
+      
+      // Clear the field and enter phone number (without +1 since it's already there)
+      const phoneNumberOnly = PHONE_NUMBER.replace(/^\+1/, '').trim();
+      debug(`Entering phone number: ${phoneNumberOnly}`);
+      
+      // Use a more robust typing method with error handling
+      try {
+        await usernameInput.click();
+        await new Promise(resolve => setTimeout(resolve, 500));
+        await usernameInput.evaluate(el => el.value = '');
+        await usernameInput.type(phoneNumberOnly, { delay: 100 });
+        debug('Phone number entered successfully');
+      } catch (error) {
+        debug(`Error entering phone number: ${error.message}`);
+        // Try alternative method
+        await page.evaluate((phone) => {
+          const input = document.querySelector('input[name="username"], input[type="tel"], input[type="text"]');
+          if (input) {
+            input.focus();
+            input.value = '';
+            input.value = phone;
+            input.dispatchEvent(new Event('input', { bubbles: true }));
+            input.dispatchEvent(new Event('change', { bubbles: true }));
+          }
+        }, phoneNumberOnly);
+        debug('Phone number entered via alternative method');
+      }
 
-      console.log('📨 Submitting username / phone number...');
+      console.log('📨 Submitting phone number...');
+      debug(`Current URL before submit: ${page.url()}`);
 
-      await Promise.allSettled([
-        page.waitForNavigation({ waitUntil: 'networkidle0', timeout: NAVIGATION_TIMEOUT }),
-        page.keyboard.press('Enter')
-      ]);
+      // Try pressing Enter first
+      await page.keyboard.press('Enter');
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      
+      debug(`URL after Enter key: ${page.url()}`);
 
-      // Fallback: click an explicit button if navigation did not happen.
-      if ((await page.url()).includes('auth.openai.com')) {
-        debug('Still on auth.openai.com after submitting username, attempting button click fallback.');
-        await clickFirstMatching(page, ['continue', 'next', 'login', 'log in']);
-        await page.waitForTimeout(1500);
-      } else {
-        debug(`Navigated to ${page.url()} after submitting username.`);
+      // If still on the same page, try clicking a button
+      if ((await page.url()).includes('log-in-or-create-account')) {
+        debug('Still on phone number page, trying button click...');
+        const clicked = await clickFirstMatching(page, ['continue', 'next', 'log in', 'sign in']);
+        if (clicked) {
+          debug('Clicked button, waiting for navigation...');
+          await new Promise(resolve => setTimeout(resolve, 2000));
+          debug(`URL after button click: ${page.url()}`);
+        } else {
+          debug('No matching button found to click');
+        }
       }
 
       console.log('🔑 Entering password...');
+      debug('Looking for password input field...');
+      
       const passwordInput = await waitForAnySelector(page, [
         'input[type="password"]',
         'input[name="password"]',
         '#password'
       ], { visible: true, timeout: LOGIN_TIMEOUT });
 
+      debug('Found password input field');
       await clearAndType(passwordInput, PASSWORD);
+      debug('Password entered successfully');
 
       console.log('📨 Submitting password...');
+      debug(`Current URL before password submit: ${page.url()}`);
 
-      await Promise.allSettled([
-        page.waitForNavigation({ waitUntil: 'networkidle0', timeout: NAVIGATION_TIMEOUT }),
-        page.keyboard.press('Enter')
-      ]);
+      // Try pressing Enter first
+      await page.keyboard.press('Enter');
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      
+      debug(`URL after password Enter key: ${page.url()}`);
 
-      if ((await page.url()).includes('auth.openai.com')) {
-        debug('Still on auth.openai.com after password entry, attempting button click fallback.');
-        await clickFirstMatching(page, ['continue', 'next', 'log in', 'allow', 'accept']);
-        await page.waitForTimeout(2000);
-      } else {
-        debug(`Navigated to ${page.url()} after submitting password.`);
+      // If still on password page, try clicking a button
+      if ((await page.url()).includes('log-in/password')) {
+        debug('Still on password page, trying button click...');
+        const clicked = await clickFirstMatching(page, ['continue', 'next', 'log in', 'sign in', 'allow', 'accept']);
+        if (clicked) {
+          debug('Clicked password button, waiting for navigation...');
+          await new Promise(resolve => setTimeout(resolve, 2000));
+          debug(`URL after password button click: ${page.url()}`);
+        } else {
+          debug('No matching password button found to click');
+        }
       }
     }
 
     console.log('⏳ Waiting for ChatGPT redirect...');
     await ensureOnChatGPT(page);
-    await page.waitForTimeout(2000);
+    await new Promise(resolve => setTimeout(resolve, 2000));
 
     const token = await fetchSession(page);
     console.log('\n✅ Authentication complete!');

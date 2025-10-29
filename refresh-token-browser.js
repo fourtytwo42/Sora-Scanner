@@ -124,35 +124,69 @@ async function waitForAnySelector(page, selectors, options = {}) {
 
 async function clearAndType(page, selectors, value, { delay = 50 } = {}) {
   await retryOperation('clearAndType', async () => {
-    const selector = await waitForAnySelector(page, selectors, { visible: true, timeout: LOGIN_TIMEOUT });
-    debug(`Typing into selector: ${selector}`);
-    await page.focus(selector);
-    await page.evaluate((sel) => {
-      const element = document.querySelector(sel);
-      if (element && 'value' in element) {
-        element.value = '';
-        element.dispatchEvent(new Event('input', { bubbles: true }));
+    // Use page.evaluate to find and interact with elements directly to avoid frame detachment
+    const success = await page.evaluate(({ selectors, value }) => {
+      // Find the first visible input field matching any of the selectors
+      let input = null;
+      for (const selector of selectors) {
+        const elements = document.querySelectorAll(selector);
+        for (const element of elements) {
+          if (element.offsetParent !== null && element.type !== 'hidden') { // Check if visible
+            input = element;
+            break;
+          }
+        }
+        if (input) break;
       }
-    }, selector);
-    await page.type(selector, value, { delay });
+      
+      if (!input) {
+        console.log('No visible input field found with selectors:', selectors);
+        return false;
+      }
+      
+      // Clear and set value
+      input.focus();
+      input.value = '';
+      input.value = value;
+      
+      // Trigger events
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+      input.dispatchEvent(new Event('blur', { bubbles: true }));
+      
+      console.log('Successfully entered value into:', input.tagName, input.type || input.name || 'input');
+      return true;
+    }, { selectors, value });
+    
+    if (!success) {
+      throw new Error('Could not find or interact with input field');
+    }
+    
+    // Small delay to ensure the input is processed
+    await new Promise(resolve => setTimeout(resolve, delay));
   });
 }
 
 async function clickFirstMatching(page, texts, extraSelectors = '') {
   return retryOperation('clickFirstMatching', async () => {
     const selectorList = extraSelectors || 'button, [role="button"], a[role="button"], input[type="submit"]';
-    const candidates = await page.$$(selectorList);
-    for (const candidate of candidates) {
-      const text = (await candidate.evaluate((el) => (el.innerText || el.textContent || '').trim().toLowerCase()));
-      if (!text) continue;
-      if (texts.some((target) => text.includes(target))) {
-        debug(`Clicking element with text: ${text}`);
-        await candidate.click({ delay: 20 });
-        return true;
+    
+    const clicked = await page.evaluate(({ texts, selectorList }) => {
+      const candidates = document.querySelectorAll(selectorList);
+      for (const candidate of candidates) {
+        const text = (candidate.innerText || candidate.textContent || '').trim().toLowerCase();
+        if (!text) continue;
+        if (texts.some((target) => text.includes(target))) {
+          console.log('Clicking element with text:', text);
+          candidate.click();
+          return true;
+        }
       }
-    }
-    debug(`No matching button found for texts: ${texts.join(', ')}`);
-    return false;
+      console.log('No matching button found for texts:', texts);
+      return false;
+    }, { texts, selectorList });
+    
+    return clicked;
   });
 }
 
@@ -450,18 +484,120 @@ async function loginAndGetToken() {
         } else {
           debug('No matching button found to click');
         }
+        
+        // Wait for navigation to password page
+        debug('Waiting for navigation to password page...');
+        try {
+          await page.waitForFunction(
+            () => window.location.href.includes('/log-in/password'),
+            { timeout: 15000 }
+          );
+          debug(`Successfully navigated to password page: ${page.url()}`);
+        } catch (error) {
+          debug(`Navigation timeout, current URL: ${page.url()}`);
+          // Wait a bit longer and check if we're on a different page
+          await new Promise(resolve => setTimeout(resolve, 3000));
+          debug(`URL after additional wait: ${page.url()}`);
+          
+          // Only try direct navigation if we're still on the phone page
+          if ((await page.url()).includes('log-in-or-create-account')) {
+            debug('Still on phone page, attempting direct navigation to password page...');
+            await page.goto('https://auth.openai.com/log-in/password', { waitUntil: 'domcontentloaded', timeout: 10000 });
+            debug(`Direct navigation result: ${page.url()}`);
+          }
+        }
       }
 
       console.log('🔑 Entering password...');
       debug('Looking for password input field...');
+      debug(`Current URL before password entry: ${page.url()}`);
       
       const passwordSelectors = [
         'input[type="password"]',
-        'input[name="password"]',
-        '#password'
+        'input[name="current-password"]',
+        'input[autocomplete="current-password"]',
+        '#password',
+        'input[id*="current-password"]'
       ];
 
-      debug('Found password input field');
+      // Check if we're actually on a password page
+      const isPasswordPage = await page.evaluate(() => {
+        return document.querySelector('input[type="password"]') !== null ||
+               window.location.href.includes('/log-in/password') ||
+               document.title.toLowerCase().includes('password');
+      });
+      
+      debug(`Is password page: ${isPasswordPage}`);
+      
+      if (!isPasswordPage) {
+        debug('Not on password page, attempting to navigate...');
+        try {
+          await page.goto('https://auth.openai.com/log-in/password', { waitUntil: 'domcontentloaded', timeout: 10000 });
+          debug(`Navigated to password page: ${page.url()}`);
+        } catch (error) {
+          debug(`Failed to navigate to password page: ${error.message}`);
+          throw new Error('Could not reach password page');
+        }
+      }
+
+      // Wait for password page to be fully loaded and stable
+      debug('Waiting for password page to be fully loaded...');
+      await waitForCloudflare(page);
+      await waitForPageStability(page);
+      
+      // Debug: Check what elements are actually on the page
+      debug('Debugging password page elements...');
+      const pageElements = await page.evaluate(() => {
+        const inputs = Array.from(document.querySelectorAll('input')).map(input => ({
+          type: input.type,
+          name: input.name,
+          id: input.id,
+          className: input.className,
+          placeholder: input.placeholder,
+          visible: input.offsetParent !== null,
+          readonly: input.readOnly
+        }));
+        const passwordInputs = Array.from(document.querySelectorAll('input[type="password"]')).map(input => ({
+          type: input.type,
+          name: input.name,
+          id: input.id,
+          className: input.className,
+          placeholder: input.placeholder,
+          visible: input.offsetParent !== null,
+          readonly: input.readOnly
+        }));
+        return { allInputs: inputs, passwordInputs: passwordInputs };
+      });
+      debug('All inputs on page:', JSON.stringify(pageElements.allInputs, null, 2));
+      debug('Password inputs on page:', JSON.stringify(pageElements.passwordInputs, null, 2));
+
+      // Wait for password field to be available
+      debug('Waiting for password input field to be available...');
+      try {
+        await page.waitForFunction(() => {
+          const passwordField = document.querySelector('input[type="password"]');
+          return passwordField && passwordField.offsetParent !== null && !passwordField.readOnly;
+        }, { timeout: 15000 });
+        debug('Password field found and ready!');
+      } catch (error) {
+        debug(`Password field not found: ${error.message}`);
+        // Try to wait a bit more and check again
+        debug('Waiting additional time for page to fully load...');
+        await new Promise(resolve => setTimeout(resolve, 5000));
+        
+        // Check again
+        const passwordFieldExists = await page.evaluate(() => {
+          const passwordField = document.querySelector('input[type="password"]');
+          return passwordField && passwordField.offsetParent !== null && !passwordField.readOnly;
+        });
+        
+        if (!passwordFieldExists) {
+          throw new Error('Password field still not available after extended wait');
+        }
+        debug('Password field found after extended wait!');
+      }
+      
+      debug('Password field is available, entering password...');
       await clearAndType(page, passwordSelectors, PASSWORD, { delay: 80 });
       debug('Password entered successfully');
 

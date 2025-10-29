@@ -1,0 +1,343 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sora Scanner - Token Refresh</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background: #f5f5f5;
+        }
+        .container {
+            background: white;
+            padding: 30px;
+            border-radius: 10px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #333;
+            text-align: center;
+            margin-bottom: 30px;
+        }
+        .section {
+            margin: 20px 0;
+            padding: 20px;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            background: #fafafa;
+        }
+        button {
+            background: #007bff;
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 16px;
+            margin: 5px;
+        }
+        button:hover {
+            background: #0056b3;
+        }
+        button:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+        }
+        .status {
+            margin: 10px 0;
+            padding: 10px;
+            border-radius: 4px;
+            font-family: monospace;
+            white-space: pre-wrap;
+        }
+        .success { background: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
+        .error { background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
+        .info { background: #d1ecf1; color: #0c5460; border: 1px solid #bee5eb; }
+        .warning { background: #fff3cd; color: #856404; border: 1px solid #ffeaa7; }
+        .log-output {
+            background: #000;
+            color: #0f0;
+            padding: 15px;
+            border-radius: 4px;
+            font-family: 'Courier New', monospace;
+            font-size: 12px;
+            max-height: 400px;
+            overflow-y: auto;
+            margin: 10px 0;
+        }
+        .token-display {
+            background: #f8f9fa;
+            border: 1px solid #dee2e6;
+            padding: 15px;
+            border-radius: 4px;
+            font-family: monospace;
+            font-size: 12px;
+            word-break: break-all;
+            margin: 10px 0;
+        }
+        .env-status {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 10px;
+            margin: 10px 0;
+        }
+        .env-item {
+            padding: 8px;
+            border-radius: 4px;
+            font-family: monospace;
+            font-size: 12px;
+        }
+        .env-set { background: #d4edda; }
+        .env-missing { background: #f8d7da; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔑 Sora Scanner Token Refresh</h1>
+        
+        <div class="section">
+            <h3>📋 Environment Status</h3>
+            <div id="envStatus" class="env-status">
+                <div class="env-item env-missing">Loading...</div>
+            </div>
+        </div>
+
+        <div class="section">
+            <h3>🚀 Token Refresh Actions</h3>
+            <button onclick="refreshToken()" id="refreshBtn">🔄 Refresh Token (Automated)</button>
+            <button onclick="manualLogin()" id="manualBtn">👤 Manual Login (Browser)</button>
+            <button onclick="testCurrentToken()" id="testBtn">🧪 Test Current Token</button>
+            <button onclick="updateEnvFile()" id="updateBtn" disabled>💾 Update .env File</button>
+            
+            <div id="status" class="status info">Ready to refresh token...</div>
+            <div id="logOutput" class="log-output" style="display: none;"></div>
+        </div>
+
+        <div class="section">
+            <h3>🎫 Current Token</h3>
+            <div id="currentToken" class="token-display">Loading...</div>
+        </div>
+
+        <div class="section">
+            <h3>📊 Scanner Status</h3>
+            <button onclick="checkScannerStatus()" id="scannerBtn">📈 Check Scanner Status</button>
+            <div id="scannerStatus" class="status info">Click to check scanner status...</div>
+        </div>
+    </div>
+
+    <script>
+        var currentToken = null;
+
+        // Load environment status on page load
+        loadEnvStatus();
+        loadCurrentToken();
+
+        async function loadEnvStatus() {
+            try {
+                var response = await fetch('/api/env-status');
+                var data = await response.json();
+                
+                var envStatusDiv = document.getElementById('envStatus');
+                envStatusDiv.innerHTML = '';
+                
+                for (var key in data) {
+                    if (Object.prototype.hasOwnProperty.call(data, key)) {
+                        var value = data[key];
+                        var div = document.createElement('div');
+                        div.className = 'env-item ' + (value ? 'env-set' : 'env-missing');
+                        div.textContent = key + ': ' + (value ? 'SET' : 'MISSING');
+                        envStatusDiv.appendChild(div);
+                    }
+                }
+            } catch (error) {
+                document.getElementById('envStatus').innerHTML = 
+                    '<div class="env-item env-missing">Error loading environment status</div>';
+            }
+        }
+
+        async function loadCurrentToken() {
+            try {
+                var response = await fetch('/api/current-token');
+                var data = await response.json();
+                
+                var tokenDiv = document.getElementById('currentToken');
+                if (data.token) {
+                    currentToken = data.token;
+                    tokenDiv.textContent = data.token;
+                    document.getElementById('updateBtn').disabled = false;
+                } else {
+                    tokenDiv.textContent = 'No token found in .env file';
+                    document.getElementById('updateBtn').disabled = true;
+                }
+            } catch (error) {
+                document.getElementById('currentToken').textContent = 'Error loading token';
+            }
+        }
+
+        async function refreshToken() {
+            var btn = document.getElementById('refreshBtn');
+            var status = document.getElementById('status');
+            var logOutput = document.getElementById('logOutput');
+            
+            btn.disabled = true;
+            status.className = 'status info';
+            status.textContent = 'Starting automated token refresh...';
+            logOutput.style.display = 'block';
+            logOutput.textContent = 'Starting refresh process...\n';
+            
+            try {
+                var response = await fetch('/api/refresh-token', { method: 'POST' });
+                var data = await response.json();
+                
+                if (data.success) {
+                    status.className = 'status success';
+                    status.textContent = 'Token refresh completed successfully!';
+                    currentToken = data.token;
+                    document.getElementById('currentToken').textContent = data.token;
+                    document.getElementById('updateBtn').disabled = false;
+                } else {
+                    status.className = 'status error';
+                    status.textContent = 'Token refresh failed: ' + data.error;
+                }
+                
+                logOutput.textContent = data.logs || 'No logs available';
+            } catch (error) {
+                status.className = 'status error';
+                status.textContent = 'Error: ' + error.message;
+                logOutput.textContent = 'Error: ' + error.message;
+            } finally {
+                btn.disabled = false;
+            }
+        }
+
+        async function manualLogin() {
+            var btn = document.getElementById('manualBtn');
+            var status = document.getElementById('status');
+            
+            btn.disabled = true;
+            status.className = 'status info';
+            status.textContent = 'Opening browser for manual login...';
+            
+            try {
+                var response = await fetch('/api/manual-login', { method: 'POST' });
+                var data = await response.json();
+                
+                if (data.success) {
+                    status.className = 'status success';
+                    status.textContent = 'Manual login completed! Token extracted.';
+                    currentToken = data.token;
+                    document.getElementById('currentToken').textContent = data.token;
+                    document.getElementById('updateBtn').disabled = false;
+                } else {
+                    status.className = 'status error';
+                    status.textContent = 'Manual login failed: ' + data.error;
+                }
+                var logOutput = document.getElementById('logOutput');
+                logOutput.style.display = 'block';
+                logOutput.textContent = (data && data.logs) ? data.logs : 'No logs available';
+            } catch (error) {
+                status.className = 'status error';
+                status.textContent = 'Error: ' + error.message;
+            } finally {
+                btn.disabled = false;
+            }
+        }
+
+        async function testCurrentToken() {
+            var btn = document.getElementById('testBtn');
+            var status = document.getElementById('status');
+            
+            btn.disabled = true;
+            status.className = 'status info';
+            status.textContent = 'Testing current token...';
+            
+            try {
+                var response = await fetch('/api/test-token', { method: 'POST' });
+                var data = await response.json();
+                
+                if (data.valid) {
+                    status.className = 'status success';
+                    status.textContent = 'Token is valid! Expires: ' + data.expires;
+                } else {
+                    status.className = 'status error';
+                    status.textContent = 'Token is invalid: ' + data.error;
+                }
+            } catch (error) {
+                status.className = 'status error';
+                status.textContent = 'Error: ' + error.message;
+            } finally {
+                btn.disabled = false;
+            }
+        }
+
+        async function updateEnvFile() {
+            if (!currentToken) {
+                alert('No token to update!');
+                return;
+            }
+            
+            var btn = document.getElementById('updateBtn');
+            var status = document.getElementById('status');
+            
+            btn.disabled = true;
+            status.className = 'status info';
+            status.textContent = 'Updating .env file...';
+            
+            try {
+                var response = await fetch('/api/update-env', { 
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ token: currentToken })
+                });
+                var data = await response.json();
+                
+                if (data.success) {
+                    status.className = 'status success';
+                    status.textContent = '.env file updated successfully!';
+                } else {
+                    status.className = 'status error';
+                    status.textContent = 'Failed to update .env: ' + data.error;
+                }
+            } catch (error) {
+                status.className = 'status error';
+                status.textContent = 'Error: ' + error.message;
+            } finally {
+                btn.disabled = false;
+            }
+        }
+
+        async function checkScannerStatus() {
+            var btn = document.getElementById('scannerBtn');
+            var status = document.getElementById('scannerStatus');
+            
+            btn.disabled = true;
+            status.className = 'status info';
+            status.textContent = 'Checking scanner status...';
+            
+            try {
+                var response = await fetch('/api/scanner-status');
+                var data = await response.json();
+                
+                if (data.running) {
+                    status.className = 'status success';
+                    status.textContent = 'Scanner is running! Posts: ' + data.posts + ', Status: ' + data.status;
+                } else {
+                    status.className = 'status warning';
+                    status.textContent = 'Scanner is not running. Status: ' + data.status;
+                }
+            } catch (error) {
+                status.className = 'status error';
+                status.textContent = 'Error: ' + error.message;
+            } finally {
+                btn.disabled = false;
+            }
+        }
+    </script>
+</body>
+</html>
+
+

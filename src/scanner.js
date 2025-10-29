@@ -38,6 +38,57 @@ let scanHistory = [];
 const MAX_HISTORY = 6;
 let statsServer;
 let dashboardCache = { timestamp: 0, data: null };
+let tokenCache = null; // cache of valid tokens
+
+// JWT helpers and storage
+function parseJwtExp(token) {
+  try {
+    const parts = token.split('.');
+    if (parts.length !== 3) return null;
+    const payload = JSON.parse(Buffer.from(parts[1], 'base64').toString('utf8'));
+    if (!payload || !payload.exp) return null;
+    return new Date(payload.exp * 1000);
+  } catch (_) {
+    return null;
+  }
+}
+
+async function ensureJwtTable() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS jwt_tokens (
+      id SERIAL PRIMARY KEY,
+      token TEXT UNIQUE NOT NULL,
+      expires_at TIMESTAMP NOT NULL,
+      added_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+  await pool.query(`DELETE FROM jwt_tokens WHERE expires_at <= NOW()`);
+}
+
+async function listValidTokens() {
+  const result = await pool.query(
+    `SELECT id, token, expires_at, added_at FROM jwt_tokens WHERE expires_at > NOW() ORDER BY expires_at DESC, added_at DESC`
+  );
+  return result.rows;
+}
+
+async function addToken(token) {
+  const exp = parseJwtExp(token);
+  if (!exp) throw new Error('Invalid JWT format');
+  if (exp.getTime() <= Date.now()) throw new Error('Token already expired');
+  await pool.query(`INSERT INTO jwt_tokens(token, expires_at) VALUES ($1, to_timestamp($2/1000.0)) ON CONFLICT (token) DO NOTHING`, [token, exp.getTime()]);
+  tokenCache = null;
+}
+
+async function removeTokenById(id) {
+  await pool.query(`DELETE FROM jwt_tokens WHERE id = $1`, [id]);
+  tokenCache = null;
+}
+
+async function removeTokenByToken(token) {
+  await pool.query(`DELETE FROM jwt_tokens WHERE token = $1`, [token]);
+  tokenCache = null;
+}
 
 // Calculate orientation from width/height
 function getOrientation(width, height) {
@@ -55,8 +106,8 @@ function framesToDuration(nFrames) {
   return parseFloat((nFrames / 30).toFixed(2));
 }
 
-// Fetch feed from Sora API
-async function fetchSoraFeed(limit = FETCH_LIMIT) {
+// Low-level fetch with explicit token
+async function fetchSoraFeedRaw(limit = FETCH_LIMIT, bearerToken) {
   return new Promise((resolve, reject) => {
     const options = {
       hostname: 'sora.chatgpt.com',
@@ -65,7 +116,7 @@ async function fetchSoraFeed(limit = FETCH_LIMIT) {
       timeout: 30000,
       headers: {
         'Accept': 'application/json',
-        'Authorization': `Bearer ${process.env.AUTH_BEARER_TOKEN}`,
+        'Authorization': `Bearer ${bearerToken}`,
         'User-Agent': process.env.USER_AGENT || 'SoraScanner/2.0',
         'Accept-Language': process.env.ACCEPT_LANGUAGE || 'en-US,en;q=0.9',
         'Cookie': [
@@ -82,9 +133,17 @@ async function fetchSoraFeed(limit = FETCH_LIMIT) {
       res.on('data', chunk => data += chunk);
       res.on('end', () => {
         try {
+          if (res.statusCode === 401 || res.statusCode === 403) {
+            const err = new Error(`HTTP ${res.statusCode}`);
+            err.statusCode = res.statusCode;
+            reject(err);
+            return;
+          }
           const json = JSON.parse(data);
           if (json.error) {
-            reject(new Error(`API Error: ${JSON.stringify(json.error)}`));
+            const err = new Error(`API Error: ${JSON.stringify(json.error)}`);
+            err.statusCode = res.statusCode || 500;
+            reject(err);
             return;
           }
           if (!json.items || !Array.isArray(json.items)) {
@@ -104,6 +163,40 @@ async function fetchSoraFeed(limit = FETCH_LIMIT) {
       reject(new Error('Request timeout'));
     });
   });
+}
+
+// High-level fetch that rotates tokens and fails over
+async function fetchSoraFeed(limit = FETCH_LIMIT) {
+  // Load tokens from DB; if none, fall back to env
+  const tokens = await listValidTokens();
+  const candidates = tokens.length > 0 ? tokens.map(t => ({ id: t.id, token: t.token }))
+                                       : [{ id: null, token: process.env.AUTH_BEARER_TOKEN }].filter(x => x.token);
+
+  if (candidates.length === 0) {
+    const err = new Error('No valid JWT tokens available');
+    err.noTokens = true;
+    throw err;
+  }
+
+  let lastError = null;
+  for (const c of candidates) {
+    try {
+      return await fetchSoraFeedRaw(limit, c.token);
+    } catch (e) {
+      lastError = e;
+      // If unauthorized/invalid, remove and try next
+      if (e && (e.statusCode === 401 || e.statusCode === 403 || /invalid token|jwt/i.test(e.message))) {
+        if (c.id) {
+          await removeTokenById(c.id);
+          console.warn(`🔁 Removed invalid token id=${c.id}, trying next`);
+        }
+        continue;
+      }
+      // For other errors, don't rotate token list; break
+      break;
+    }
+  }
+  throw lastError || new Error('Failed to fetch feed');
 }
 
 // Process and store posts
@@ -531,6 +624,10 @@ async function fetchDashboardData() {
     const recentScans = recentScansResult.rows || [];
     const recentTotals = recentTotalsResult.rows[0] || { last_hour: 0, last_24h: 0 };
 
+    // Count valid tokens
+    const tokensCountRes = await pool.query(`SELECT COUNT(*)::INT AS count FROM jwt_tokens WHERE expires_at > NOW()`);
+    const tokensListRes = await pool.query(`SELECT id, expires_at, added_at FROM jwt_tokens ORDER BY expires_at DESC`);
+
     const data = {
       stats,
       totals,
@@ -539,7 +636,11 @@ async function fetchDashboardData() {
       daily,
       recentScans,
       recentTotals,
-      generatedAt: new Date()
+      generatedAt: new Date(),
+      jwt: {
+        count: tokensCountRes.rows[0]?.count || 0,
+        tokens: tokensListRes.rows
+      }
     };
 
     dashboardCache = { timestamp: now, data };
@@ -559,6 +660,7 @@ function renderDashboardHTML(data) {
     daily = [],
     recentScans = [],
     recentTotals = {},
+    jwt = { count: 0, tokens: [] },
     generatedAt = new Date()
   } = data;
 
@@ -762,6 +864,10 @@ function renderDashboardHTML(data) {
           </div>
         </header>
 
+        ${jwt.count === 0 ? `<div style="background:#5a0000;border:1px solid #ff6b6b;color:#ffdede;padding:12px 16px;border-radius:10px;margin:0 0 16px;">
+          <strong>No valid JWT tokens.</strong> Add a token below to resume scanning.
+        </div>` : ''}
+
         <section class="grid">
           <div class="card">
             <h2>Total Posts Indexed</h2>
@@ -848,6 +954,63 @@ function renderDashboardHTML(data) {
           </div>
         </section>
 
+        <section class="section">
+          <h2 class="section-title">JWT Tokens</h2>
+          <div class="card">
+            <form id="addTokenForm" onsubmit="return addToken(event)" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+              <input id="tokenInput" type="text" placeholder="Paste JWT token here" style="flex:1;min-width:320px;padding:10px;border-radius:8px;border:1px solid rgba(148,163,184,0.3);background:rgba(15,23,42,0.6);color:#fff" />
+              <button type="submit" style="padding:10px 14px;border-radius:8px;border:1px solid rgba(148,163,184,0.3);background:rgba(59,130,246,0.25);color:#dbeafe;cursor:pointer;">Add Token</button>
+            </form>
+            <div id="tokenMsg" class="hint" style="margin-top:8px;"></div>
+            <div class="table-wrapper" style="margin-top:12px;">
+              <table>
+                <thead>
+                  <tr>
+                    <th>ID</th>
+                    <th>Expires</th>
+                    <th>Added</th>
+                    <th>Actions</th>
+                  </tr>
+                </thead>
+                <tbody id="tokensBody">
+                  ${jwt.tokens.length > 0 ? jwt.tokens.map(t => `
+                    <tr>
+                      <td>${t.id}</td>
+                      <td>${formatTimestamp(t.expires_at)}</td>
+                      <td>${formatTimestamp(t.added_at)}</td>
+                      <td>
+                        <button onclick="deleteToken(${t.id})" style="padding:6px 10px;border-radius:8px;border:1px solid rgba(148,163,184,0.3);background:rgba(239,68,68,0.25);color:#fecaca;cursor:pointer;">Remove</button>
+                      </td>
+                    </tr>
+                  `).join('') : `<tr><td colspan="4" class="muted">No tokens yet.</td></tr>`}
+                </tbody>
+              </table>
+            </div>
+            <script>
+              async function addToken(e){
+                e.preventDefault();
+                const input = document.getElementById('tokenInput');
+                const msg = document.getElementById('tokenMsg');
+                msg.textContent = 'Validating and adding...';
+                try{
+                  const res = await fetch('/api/tokens', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ token: input.value.trim() }) });
+                  const j = await res.json();
+                  if(!res.ok || !j.success){ throw new Error(j.error || 'Failed'); }
+                  location.reload();
+                }catch(err){ msg.textContent = 'Error: ' + err.message; }
+              }
+              async function deleteToken(id){
+                const ok = confirm('Remove this token?');
+                if(!ok) return;
+                const res = await fetch('/api/tokens/' + id, { method:'DELETE' });
+                const j = await res.json();
+                if(!res.ok || !j.success){ alert(j.error || 'Failed'); return; }
+                location.reload();
+              }
+            </script>
+          </div>
+        </section>
+
         <footer>
           Updated ${formatTimestamp(generatedAt)} • Auto refresh every 30s • API limit ${FETCH_LIMIT} posts/scan
         </footer>
@@ -872,6 +1035,44 @@ function startStatsServer() {
         const data = await fetchDashboardData();
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(data));
+        return;
+      }
+
+      // JWT management API
+      if (requestUrl.pathname === '/api/tokens' && req.method === 'GET') {
+        const tokens = await listValidTokens();
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ tokens }));
+        return;
+      }
+      if (requestUrl.pathname === '/api/tokens' && req.method === 'POST') {
+        let body = '';
+        req.on('data', chunk => body += chunk);
+        req.on('end', async () => {
+          try {
+            const data = JSON.parse(body || '{}');
+            const token = (data.token || '').trim();
+            if (!token) throw new Error('Missing token');
+            await addToken(token);
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ success: true }));
+          } catch (e) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ success: false, error: e.message }));
+          }
+        });
+        return;
+      }
+      if (requestUrl.pathname.startsWith('/api/tokens/') && req.method === 'DELETE') {
+        const id = parseInt(requestUrl.pathname.split('/').pop(), 10);
+        if (!Number.isFinite(id)) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: false, error: 'Invalid id' }));
+          return;
+        }
+        await removeTokenById(id);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: true }));
         return;
       }
 
@@ -923,6 +1124,8 @@ async function main() {
     const version = await client.query('SELECT version()');
     console.log(`✅ PostgreSQL connected: ${version.rows[0].version.split(' ').slice(0, 2).join(' ')}`);
     client.release();
+
+    await ensureJwtTable();
 
     await pool.query(
       `UPDATE scanner_stats

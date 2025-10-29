@@ -73,6 +73,7 @@ async function waitForAnySelector(page, selectors, options = {}) {
   let lastError;
   for (const selector of selectors) {
     try {
+      debug(`Waiting for selector: ${selector}`);
       const handle = await page.waitForSelector(selector, options);
       if (handle) {
         debug(`Matched selector: ${selector}`);
@@ -86,6 +87,7 @@ async function waitForAnySelector(page, selectors, options = {}) {
 }
 
 async function clearAndType(handle, value) {
+  debug('Clearing existing value and typing into element.');
   await handle.evaluate((element) => {
     element.focus();
     if ('value' in element) {
@@ -101,20 +103,24 @@ async function clickFirstMatching(page, texts, extraSelectors = '') {
     const text = (await candidate.evaluate((el) => el.innerText || el.textContent || '')).trim().toLowerCase();
     if (!text) continue;
     if (texts.some((target) => text.includes(target))) {
+      debug(`Clicking element with text: ${text}`);
       await candidate.click();
       return true;
     }
   }
+  debug(`No matching button found for texts: ${texts.join(', ')}`);
   return false;
 }
 
 async function ensureOnChatGPT(page) {
   try {
+    debug('Ensuring we are on chatgpt.com...');
     await page.waitForFunction(
       () => location.hostname.endsWith('chatgpt.com'),
       { timeout: NAVIGATION_TIMEOUT }
     );
   } catch (_) {
+    debug('Direct chatgpt.com check failed, forcing navigation.');
     await page.goto('https://chatgpt.com/', { waitUntil: 'networkidle0', timeout: NAVIGATION_TIMEOUT });
   }
 }
@@ -223,6 +229,18 @@ async function loginAndGetToken() {
   try {
     const page = await browser.newPage();
 
+    page.on('console', (message) => {
+      if (DEBUG_LOG) {
+        console.log('[page log]', message.text());
+      }
+    });
+
+    page.on('response', (response) => {
+      if (DEBUG_LOG) {
+        console.log('[response]', response.status(), response.url());
+      }
+    });
+
     await page.setUserAgent(
       process.env.USER_AGENT ||
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
@@ -246,6 +264,7 @@ async function loginAndGetToken() {
 
     console.log('🌐 Opening OpenAI login page...');
     await page.goto(authUrl.toString(), { waitUntil: 'networkidle0', timeout: LOGIN_TIMEOUT });
+    debug(`Initial page URL: ${page.url()}`);
 
     // Some accounts land on ChatGPT directly if a valid session already exists.
     const initialHost = new URL(page.url()).hostname;
@@ -263,6 +282,8 @@ async function loginAndGetToken() {
 
       await clearAndType(usernameInput, PHONE_NUMBER);
 
+      console.log('📨 Submitting username / phone number...');
+
       await Promise.allSettled([
         page.waitForNavigation({ waitUntil: 'networkidle0', timeout: NAVIGATION_TIMEOUT }),
         page.keyboard.press('Enter')
@@ -270,8 +291,11 @@ async function loginAndGetToken() {
 
       // Fallback: click an explicit button if navigation did not happen.
       if ((await page.url()).includes('auth.openai.com')) {
+        debug('Still on auth.openai.com after submitting username, attempting button click fallback.');
         await clickFirstMatching(page, ['continue', 'next', 'login', 'log in']);
         await page.waitForTimeout(1500);
+      } else {
+        debug(`Navigated to ${page.url()} after submitting username.`);
       }
 
       console.log('🔑 Entering password...');
@@ -283,14 +307,19 @@ async function loginAndGetToken() {
 
       await clearAndType(passwordInput, PASSWORD);
 
+      console.log('📨 Submitting password...');
+
       await Promise.allSettled([
         page.waitForNavigation({ waitUntil: 'networkidle0', timeout: NAVIGATION_TIMEOUT }),
         page.keyboard.press('Enter')
       ]);
 
       if ((await page.url()).includes('auth.openai.com')) {
+        debug('Still on auth.openai.com after password entry, attempting button click fallback.');
         await clickFirstMatching(page, ['continue', 'next', 'log in', 'allow', 'accept']);
         await page.waitForTimeout(2000);
+      } else {
+        debug(`Navigated to ${page.url()} after submitting password.`);
       }
     }
 

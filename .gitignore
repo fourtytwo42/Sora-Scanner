@@ -41,3 +41,25 @@ scanner-output.log
 
 # test files
 test-*.js
+
+# Cursor IDE files
+.cursor/
+.cursor-server/
+
+# System files
+.cache/
+.config/
+.npm/
+.nvm/
+.pm2/
+.ssh/
+.bash_history
+.bash_logout
+.bashrc
+.gitconfig
+.cookies.json
+.wget-hsts
+
+# Logs directory
+logs/
+*.log

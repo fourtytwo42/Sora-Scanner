@@ -69,47 +69,169 @@ function resolveExecutablePath() {
   return undefined;
 }
 
-async function waitForAnySelector(page, selectors, options = {}) {
-  let lastError;
-  for (const selector of selectors) {
-    try {
-      debug(`Waiting for selector: ${selector}`);
-      const handle = await page.waitForSelector(selector, options);
-      if (handle) {
-        debug(`Matched selector: ${selector}`);
-        return handle;
-      }
-    } catch (error) {
-      lastError = error;
-    }
-  }
-  throw lastError || new Error(`None of the selectors matched: ${selectors.join(', ')}`);
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function clearAndType(handle, value) {
-  debug('Clearing existing value and typing into element.');
-  await handle.evaluate((element) => {
-    element.focus();
-    if ('value' in element) {
-      element.value = '';
+function isTransientFrameError(error) {
+  if (!error || !error.message) return false;
+  return [
+    'Execution context was destroyed',
+    'Cannot find context with specified id',
+    'Target closed',
+    'Frame was detached'
+  ].some((fragment) => error.message.includes(fragment));
+}
+
+async function retryOperation(label, operation, attempts = 4, delayMs = 750) {
+  let lastError;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      debug(`${label}: attempt ${attempt}/${attempts}`);
+      return await operation();
+    } catch (error) {
+      lastError = error;
+      if (!isTransientFrameError(error) || attempt === attempts) {
+        debug(`${label} failed: ${error.message}`);
+        throw error;
+      }
+      debug(`${label}: transient error detected (${error.message}). Retrying after ${delayMs}ms...`);
+      await sleep(delayMs * attempt);
     }
+  }
+  throw lastError;
+}
+
+async function waitForAnySelector(page, selectors, options = {}) {
+  return retryOperation('waitForAnySelector', async () => {
+    let lastError;
+    for (const selector of selectors) {
+      try {
+        debug(`Waiting for selector: ${selector}`);
+        const handle = await page.waitForSelector(selector, options);
+        if (handle) {
+          debug(`Matched selector: ${selector}`);
+          await handle.dispose();
+          return selector;
+        }
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    throw lastError || new Error(`None of the selectors matched: ${selectors.join(', ')}`);
   });
-  await handle.type(value, { delay: 50 });
+}
+
+async function clearAndType(page, selectors, value, { delay = 50 } = {}) {
+  await retryOperation('clearAndType', async () => {
+    const selector = await waitForAnySelector(page, selectors, { visible: true, timeout: LOGIN_TIMEOUT });
+    debug(`Typing into selector: ${selector}`);
+    await page.focus(selector);
+    await page.evaluate((sel) => {
+      const element = document.querySelector(sel);
+      if (element && 'value' in element) {
+        element.value = '';
+        element.dispatchEvent(new Event('input', { bubbles: true }));
+      }
+    }, selector);
+    await page.type(selector, value, { delay });
+  });
 }
 
 async function clickFirstMatching(page, texts, extraSelectors = '') {
-  const candidates = await page.$$(extraSelectors || 'button, [role="button"], a[role="button"]');
-  for (const candidate of candidates) {
-    const text = (await candidate.evaluate((el) => el.innerText || el.textContent || '')).trim().toLowerCase();
-    if (!text) continue;
-    if (texts.some((target) => text.includes(target))) {
-      debug(`Clicking element with text: ${text}`);
-      await candidate.click();
-      return true;
+  return retryOperation('clickFirstMatching', async () => {
+    const selectorList = extraSelectors || 'button, [role="button"], a[role="button"], input[type="submit"]';
+    const candidates = await page.$$(selectorList);
+    for (const candidate of candidates) {
+      const text = (await candidate.evaluate((el) => (el.innerText || el.textContent || '').trim().toLowerCase()));
+      if (!text) continue;
+      if (texts.some((target) => text.includes(target))) {
+        debug(`Clicking element with text: ${text}`);
+        await candidate.click({ delay: 20 });
+        return true;
+      }
     }
+    debug(`No matching button found for texts: ${texts.join(', ')}`);
+    return false;
+  });
+}
+
+async function triggerNavigation(page, action, label) {
+  return retryOperation(label, async () => {
+    let navigation;
+    const startNavigationListener = () => {
+      navigation = page
+        .waitForNavigation({ waitUntil: 'domcontentloaded', timeout: NAVIGATION_TIMEOUT })
+        .catch((error) => {
+          if (error.message.includes('Navigation timeout')) {
+            debug(`${label}: navigation timeout (likely single-page transition).`);
+            return null;
+          }
+          throw error;
+        });
+    };
+
+    startNavigationListener();
+    const actionResult = await action();
+
+    if (actionResult === false) {
+      debug(`${label}: action reported no-op, skipping wait.`);
+      return false;
+    }
+
+    await Promise.race([navigation, sleep(2000)]);
+    return actionResult !== undefined ? actionResult : true;
+  });
+}
+
+async function waitForCloudflare(page) {
+  const challengeSelectors = [
+    '#challenge-stage',
+    '.cf-browser-verification',
+    '[data-testid="challenge-spinner"]',
+    '#cf-spinner-please-wait'
+  ];
+
+  const activeChallenge = await page.evaluate((selectors) => {
+    return selectors.some((selector) => document.querySelector(selector));
+  }, challengeSelectors);
+
+  if (!activeChallenge) {
+    return;
   }
-  debug(`No matching button found for texts: ${texts.join(', ')}`);
-  return false;
+
+  console.log('🛡️  Cloudflare challenge detected, waiting for completion...');
+  await retryOperation('waitForCloudflare', async () => {
+    await page.waitForFunction(
+      (selectors) => !selectors.some((selector) => document.querySelector(selector)),
+      { timeout: 30_000 },
+      challengeSelectors
+    );
+  }, 6, 1000);
+  await sleep(500);
+  debug('Cloudflare challenge cleared.');
+}
+
+async function waitForPageStability(page, { timeout = 15_000, checkInterval = 500 } = {}) {
+  const maxChecks = Math.ceil(timeout / checkInterval);
+  let lastSize = -1;
+  let stableCount = 0;
+
+  for (let i = 0; i < maxChecks; i++) {
+    const currentSize = await page.evaluate(() => document.body ? document.body.innerText.length : 0);
+    if (currentSize === lastSize) {
+      stableCount += 1;
+      if (stableCount >= 3) {
+        debug('Page considered stable.');
+        return;
+      }
+    } else {
+      stableCount = 0;
+      lastSize = currentSize;
+    }
+    await sleep(checkInterval);
+  }
+  debug('Page stability wait timed out, proceeding anyway.');
 }
 
 async function ensureOnChatGPT(page) {
@@ -249,17 +371,25 @@ async function loginAndGetToken() {
       'Accept-Language': process.env.ACCEPT_LANGUAGE || 'en-US,en;q=0.9'
     });
 
+    page.setDefaultTimeout(LOGIN_TIMEOUT);
+    page.setDefaultNavigationTimeout(LOGIN_TIMEOUT);
+
+    page.on('framedetached', (frame) => {
+      debug(`Frame detached: ${frame.url()}`);
+    });
+
     // Go directly to the phone number login page
     const phoneLoginUrl = 'https://auth.openai.com/log-in-or-create-account?usernameKind=phone_number';
     
     console.log('🌐 Opening OpenAI phone number login page...');
     debug(`Navigating to: ${phoneLoginUrl}`);
-    await page.goto(phoneLoginUrl, { waitUntil: 'networkidle0', timeout: LOGIN_TIMEOUT });
+    await page.goto(phoneLoginUrl, { waitUntil: 'domcontentloaded', timeout: LOGIN_TIMEOUT });
     debug(`Initial page URL: ${page.url()}`);
     debug(`Page title: ${await page.title()}`);
-    
+
     // Wait for the page to be fully loaded and stable
-    await new Promise(resolve => setTimeout(resolve, 3000));
+    await waitForCloudflare(page);
+    await waitForPageStability(page);
     debug('Page should be stable now');
 
     // Some accounts land on ChatGPT directly if a valid session already exists.
@@ -279,7 +409,7 @@ async function loginAndGetToken() {
       
       debug('Page is fully interactive, looking for input field...');
       
-      const usernameInput = await waitForAnySelector(page, [
+      const usernameSelectors = [
         'input[name="username"]',
         'input[type="email"]',
         'input[type="text"]',
@@ -287,53 +417,35 @@ async function loginAndGetToken() {
         '#username',
         'input[placeholder*="phone"]',
         'input[placeholder*="number"]'
-      ], { visible: true, timeout: LOGIN_TIMEOUT });
+      ];
 
       debug('Found phone number input field');
-      
+
       // Clear the field and enter phone number (without +1 since it's already there)
       const phoneNumberOnly = PHONE_NUMBER.replace(/^\+1/, '').trim();
       debug(`Entering phone number: ${phoneNumberOnly}`);
-      
-      // Use a more robust typing method with error handling
-      try {
-        await usernameInput.click();
-        await new Promise(resolve => setTimeout(resolve, 500));
-        await usernameInput.evaluate(el => el.value = '');
-        await usernameInput.type(phoneNumberOnly, { delay: 100 });
-        debug('Phone number entered successfully');
-      } catch (error) {
-        debug(`Error entering phone number: ${error.message}`);
-        // Try alternative method
-        await page.evaluate((phone) => {
-          const input = document.querySelector('input[name="username"], input[type="tel"], input[type="text"]');
-          if (input) {
-            input.focus();
-            input.value = '';
-            input.value = phone;
-            input.dispatchEvent(new Event('input', { bubbles: true }));
-            input.dispatchEvent(new Event('change', { bubbles: true }));
-          }
-        }, phoneNumberOnly);
-        debug('Phone number entered via alternative method');
-      }
+
+      await clearAndType(page, usernameSelectors, phoneNumberOnly, { delay: 90 });
+      debug('Phone number entered successfully');
 
       console.log('📨 Submitting phone number...');
       debug(`Current URL before submit: ${page.url()}`);
 
       // Try pressing Enter first
-      await page.keyboard.press('Enter');
-      await new Promise(resolve => setTimeout(resolve, 2000));
-      
+      await triggerNavigation(page, () => page.keyboard.press('Enter'), 'Phone submit (Enter)');
+
       debug(`URL after Enter key: ${page.url()}`);
 
       // If still on the same page, try clicking a button
       if ((await page.url()).includes('log-in-or-create-account')) {
         debug('Still on phone number page, trying button click...');
-        const clicked = await clickFirstMatching(page, ['continue', 'next', 'log in', 'sign in']);
+        const clicked = await triggerNavigation(
+          page,
+          () => clickFirstMatching(page, ['continue', 'next', 'log in', 'sign in']),
+          'Phone submit (button)'
+        );
         if (clicked) {
           debug('Clicked button, waiting for navigation...');
-          await new Promise(resolve => setTimeout(resolve, 2000));
           debug(`URL after button click: ${page.url()}`);
         } else {
           debug('No matching button found to click');
@@ -343,32 +455,34 @@ async function loginAndGetToken() {
       console.log('🔑 Entering password...');
       debug('Looking for password input field...');
       
-      const passwordInput = await waitForAnySelector(page, [
+      const passwordSelectors = [
         'input[type="password"]',
         'input[name="password"]',
         '#password'
-      ], { visible: true, timeout: LOGIN_TIMEOUT });
+      ];
 
       debug('Found password input field');
-      await clearAndType(passwordInput, PASSWORD);
+      await clearAndType(page, passwordSelectors, PASSWORD, { delay: 80 });
       debug('Password entered successfully');
 
       console.log('📨 Submitting password...');
       debug(`Current URL before password submit: ${page.url()}`);
 
       // Try pressing Enter first
-      await page.keyboard.press('Enter');
-      await new Promise(resolve => setTimeout(resolve, 2000));
-      
+      await triggerNavigation(page, () => page.keyboard.press('Enter'), 'Password submit (Enter)');
+
       debug(`URL after password Enter key: ${page.url()}`);
 
       // If still on password page, try clicking a button
       if ((await page.url()).includes('log-in/password')) {
         debug('Still on password page, trying button click...');
-        const clicked = await clickFirstMatching(page, ['continue', 'next', 'log in', 'sign in', 'allow', 'accept']);
+        const clicked = await triggerNavigation(
+          page,
+          () => clickFirstMatching(page, ['continue', 'next', 'log in', 'sign in', 'allow', 'accept']),
+          'Password submit (button)'
+        );
         if (clicked) {
           debug('Clicked password button, waiting for navigation...');
-          await new Promise(resolve => setTimeout(resolve, 2000));
           debug(`URL after password button click: ${page.url()}`);
         } else {
           debug('No matching password button found to click');

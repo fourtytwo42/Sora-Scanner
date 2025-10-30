@@ -1,3 +1,43 @@
+# 🗄️ Sora Feed Database Schema (Simplified)
+
+## Overview
+
+The scanner uses a minimal schema focused on fields we actually query. This keeps storage small and ingestion fast.
+
+## Tables
+
+### 1) `sora_posts`
+
+```sql
+CREATE TABLE sora_posts (
+  id TEXT PRIMARY KEY,
+  posted_at BIGINT NOT NULL,
+  orientation TEXT NOT NULL CHECK (orientation IN ('wide','tall','square')),
+  duration NUMERIC(5,2) NOT NULL,
+  prompt TEXT,
+  indexed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+Indexes:
+- `idx_posts_posted_at` on `(posted_at DESC)`
+- `idx_posts_orientation` on `(orientation)`
+- `idx_posts_duration` on `(duration)`
+- `idx_posts_prompt_fts` on `to_tsvector('english', COALESCE(prompt,''))` (GIN)
+- `idx_posts_indexed_at` on `(indexed_at DESC)`
+
+### 2) `scanner_stats`
+Tracks scan metrics used by the dashboard (totals, timings, overlap, posts/sec, errors).
+
+## Notes
+- No `creators` table; no media URL storage. Orientation/duration are derived at ingest.
+- `pg_trgm` extension is enabled for text search support when needed.
+
+---
+
+Last Updated: October 30, 2025  
+Schema Version: 3.0 (Simplified)
+
 # 🗄️ Sora Feed Database Schema
 
 ## Overview

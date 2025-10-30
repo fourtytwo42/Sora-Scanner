@@ -20,32 +20,16 @@
 
 ## Tables Created
 
-### 1. `creators` Table
-Stores user/creator profile information:
+### 1. `sora_posts` Table
+Simplified post metadata:
 - `id` (PRIMARY KEY)
-- `username`
-- `display_name`
-- `profile_picture_url`
-- `permalink`
-- `follower_count`, `following_count`, `post_count`
-- `verified`
-- `first_seen`, `last_updated`
+- `posted_at`
+- `orientation` ('wide' | 'tall' | 'square')
+- `duration` (seconds)
+- `prompt`
+- `indexed_at`
 
-### 2. `sora_posts` Table
-Stores video post data:
-- `id` (PRIMARY KEY)
-- `creator_id` (FOREIGN KEY → creators.id)
-- `text`
-- `posted_at`, `updated_at`
-- `permalink`
-- `video_url`, `video_url_md`
-- `thumbnail_url`, `gif_url`
-- `width`, `height`
-- `generation_id`, `task_id`
-- `like_count`, `view_count`, `remix_count`
-- `indexed_at`, `last_updated`
-
-### 3. `scanner_stats` Table
+### 2. `scanner_stats` Table
 Tracks scanner performance:
 - `id` (PRIMARY KEY)
 - `scan_timestamp`
@@ -59,10 +43,11 @@ Tracks scanner performance:
 ## Indexes Created
 
 Performance indexes for fast queries:
-- ✅ `idx_sora_posts_creator_id` - Creator lookups
-- ✅ `idx_sora_posts_posted_at` - Time-based queries
-- ✅ `idx_sora_posts_indexed_at` - Recent posts
-- ✅ `idx_creators_username` - Username searches
+- ✅ `idx_posts_posted_at` - Time-based queries
+- ✅ `idx_posts_orientation` - Orientation filter
+- ✅ `idx_posts_duration` - Duration queries
+- ✅ `idx_posts_prompt_fts` - Full-text search on prompt
+- ✅ `idx_posts_indexed_at` - Recent posts
 - ✅ `idx_scanner_stats_timestamp` - Stats queries
 
 ---
@@ -161,8 +146,8 @@ psql -U postgres -d sora_feed -c "SELECT COUNT(*) FROM sora_posts;"
 # View recent scans
 psql -U postgres -d sora_feed -c "SELECT * FROM scanner_stats ORDER BY scan_timestamp DESC LIMIT 5;"
 
-# View creators
-psql -U postgres -d sora_feed -c "SELECT username, post_count FROM creators;"
+# Orientation distribution
+psql -U postgres -d sora_feed -c "SELECT orientation, COUNT(*) FROM sora_posts GROUP BY orientation ORDER BY COUNT(*) DESC;"
 ```
 
 ---

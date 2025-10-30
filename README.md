@@ -130,8 +130,7 @@ soraFeed/
 - Real-time performance monitoring
 
 ### Database Schema
-- **creators** - User profile information
-- **sora_posts** - Video post data with metadata
+- **sora_posts** - Minimal video post metadata (orientation/duration/prompt)
 - **scanner_stats** - Performance and error tracking
 
 ### Error Handling
@@ -176,40 +175,20 @@ Edit `src/scanner.js` to customize:
 
 ## 📊 Database Schema
 
-### creators
-- `id` (PRIMARY KEY) - User ID
-- `username` - Username
-- `display_name` - Display name
-- `profile_picture_url` - Profile picture
-- `permalink` - Profile URL
-- `follower_count`, `following_count`, `post_count` - Stats
-- `verified` - Verification status
-- `first_seen`, `last_updated` - Timestamps
+### sora_posts (simplified)
+- `id` (TEXT, PRIMARY KEY)
+- `posted_at` (BIGINT)
+- `orientation` (TEXT: 'wide' | 'tall' | 'square')
+- `duration` (NUMERIC(5,2))
+- `prompt` (TEXT)
+- `indexed_at` (TIMESTAMP)
 
-### sora_posts
-- `id` (PRIMARY KEY) - Post ID
-- `creator_id` (FOREIGN KEY) - References creators.id
-- `text` - Post caption
-- `posted_at`, `updated_at` - Timestamps
-- `permalink` - Post URL
-- `video_url`, `video_url_md` - Video URLs
-- `thumbnail_url`, `gif_url` - Media URLs
-- `width`, `height` - Video dimensions
-- `generation_id`, `task_id` - Generation metadata
-- `like_count`, `view_count`, `remix_count` - Engagement
-- `indexed_at`, `last_updated` - Timestamps
+Indexes: posted_at DESC, orientation, duration, prompt FTS (GIN), indexed_at DESC
 
 ### scanner_stats
 - `total_scanned`, `new_posts`, `duplicate_posts`, `errors`
 - `last_scan_at`, `scan_duration_ms`, `current_poll_interval`
-- `last_overlap_pct`, `last_posts_per_second`, `last_new_posts`, `last_duplicates`
-- `consecutive_errors`, `last_error_at`, `scanner_started_at`
-
-### scanner_scan_history
-- `started_at`, `completed_at`, `duration_ms`
-- `fetch_count`, `new_posts`, `duplicate_posts`
-- `overlap_pct`, `posts_per_second`, `poll_interval_ms`
-- `status`, `error_message`
+- Additional metrics used by dashboard (e.g., overlap, posts/sec)
 
 ## 🐛 Troubleshooting
 

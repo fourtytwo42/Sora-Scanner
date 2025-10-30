@@ -128,59 +128,37 @@ try {
     warning('pg_trgm extension check: ' + error.message);
   }
 
-  // Create creators table
-  await client.query(`
-    CREATE TABLE IF NOT EXISTS creators (
-      id TEXT PRIMARY KEY,
-      username TEXT NOT NULL,
-      display_name TEXT,
-      profile_picture_url TEXT,
-      permalink TEXT,
-      follower_count INTEGER DEFAULT 0,
-      following_count INTEGER DEFAULT 0,
-      post_count INTEGER DEFAULT 0,
-      verified BOOLEAN DEFAULT false,
-      first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
-  `);
-
-  // Create posts table with normalized schema
+  // Create simplified posts table schema
   await client.query(`
     CREATE TABLE IF NOT EXISTS sora_posts (
       id TEXT PRIMARY KEY,
-      creator_id TEXT NOT NULL REFERENCES creators(id),
-      text TEXT,
       posted_at BIGINT NOT NULL,
-      updated_at BIGINT,
-      permalink TEXT NOT NULL,
-      video_url TEXT,
-      video_url_md TEXT,
-      thumbnail_url TEXT,
-      gif_url TEXT,
-      width INTEGER,
-      height INTEGER,
-      generation_id TEXT,
-      task_id TEXT,
-      like_count INTEGER DEFAULT 0,
-      view_count INTEGER DEFAULT 0,
-      remix_count INTEGER DEFAULT 0,
-      indexed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      orientation TEXT NOT NULL CHECK (orientation IN ('wide', 'tall', 'square')),
+      duration NUMERIC(5,2) NOT NULL,
+      prompt TEXT,
+      indexed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
   `);
   
   // Create indexes
   await client.query(`
-    CREATE INDEX IF NOT EXISTS idx_sora_posts_posted_at ON sora_posts(posted_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_posts_posted_at ON sora_posts (posted_at DESC);
   `);
-  
+
   await client.query(`
-    CREATE INDEX IF NOT EXISTS idx_sora_posts_indexed_at ON sora_posts(indexed_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_posts_orientation ON sora_posts (orientation);
   `);
-  
+
   await client.query(`
-    CREATE INDEX IF NOT EXISTS idx_sora_posts_text ON sora_posts USING gin(to_tsvector('english', COALESCE(text, '')));
+    CREATE INDEX IF NOT EXISTS idx_posts_duration ON sora_posts (duration);
+  `);
+
+  await client.query(`
+    CREATE INDEX IF NOT EXISTS idx_posts_prompt_fts ON sora_posts USING gin(to_tsvector('english', COALESCE(prompt, '')));
+  `);
+
+  await client.query(`
+    CREATE INDEX IF NOT EXISTS idx_posts_indexed_at ON sora_posts (indexed_at DESC);
   `);
   
   // Create scanner_stats table with full schema

@@ -58,6 +58,41 @@ Performance indexes for fast queries:
 
 ---
 
+## Database Size
+
+Check database and table sizes:
+
+```sql
+-- Total database size in GB
+SELECT pg_size_pretty(pg_database_size('sora_feed')) AS total_size;
+
+-- Size in GB (numeric)
+SELECT ROUND(pg_database_size('sora_feed')::NUMERIC / (1024^3), 2) AS total_size_gb;
+
+-- Individual table sizes
+SELECT 
+  schemaname,
+  tablename,
+  pg_size_pretty(pg_total_relation_size(schemaname||'.'||tablename)) AS size,
+  pg_size_pretty(pg_relation_size(schemaname||'.'||tablename)) AS table_size,
+  pg_size_pretty(pg_total_relation_size(schemaname||'.'||tablename) - pg_relation_size(schemaname||'.'||tablename)) AS indexes_size
+FROM pg_tables
+WHERE schemaname = 'public'
+ORDER BY pg_total_relation_size(schemaname||'.'||tablename) DESC;
+```
+
+### Quick Command Line Check
+
+```bash
+# Total database size in GB
+psql -U postgres -d sora_feed -c "SELECT ROUND(pg_database_size('sora_feed')::NUMERIC / (1024^3), 2) AS total_size_gb;"
+
+# Table sizes breakdown
+psql -U postgres -d sora_feed -c "SELECT tablename, pg_size_pretty(pg_total_relation_size('public.'||tablename)) AS size FROM pg_tables WHERE schemaname = 'public' ORDER BY pg_total_relation_size('public.'||tablename) DESC;"
+```
+
+---
+
 ## Environment Configuration Status
 
 ### ✅ Configured

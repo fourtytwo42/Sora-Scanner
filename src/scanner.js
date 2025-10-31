@@ -556,7 +556,8 @@ async function fetchDashboardData() {
       durationResult,
       dailyResult,
       recentScansResult,
-      recentTotalsResult
+      recentTotalsResult,
+      dbSizeResult
     ] = await Promise.all([
       pool.query(`
         SELECT *,
@@ -614,6 +615,9 @@ async function fetchDashboardData() {
           COUNT(*) FILTER (WHERE to_timestamp(posted_at) >= NOW() - INTERVAL '1 hour')::BIGINT AS last_hour,
           COUNT(*) FILTER (WHERE to_timestamp(posted_at) >= NOW() - INTERVAL '24 hours')::BIGINT AS last_24h
         FROM sora_posts
+      `),
+      pool.query(`
+        SELECT ROUND((pg_database_size(current_database())::NUMERIC / POWER(1024, 3))::NUMERIC, 2) AS size_gb
       `)
     ]);
 
@@ -624,6 +628,7 @@ async function fetchDashboardData() {
     const daily = dailyResult.rows || [];
     const recentScans = recentScansResult.rows || [];
     const recentTotals = recentTotalsResult.rows[0] || { last_hour: 0, last_24h: 0 };
+    const dbSize = dbSizeResult.rows[0] || { size_gb: 0 };
 
     // Count valid tokens from DB
     const tokensCountRes = await pool.query(`SELECT COUNT(*)::INT AS count FROM jwt_tokens WHERE expires_at > NOW()`);
@@ -661,6 +666,7 @@ async function fetchDashboardData() {
       daily,
       recentScans,
       recentTotals,
+      dbSize,
       generatedAt: new Date(),
       jwt: {
         count: (tokensCountRes.rows[0]?.count || 0) + envTokenCount,
@@ -685,6 +691,7 @@ function renderDashboardHTML(data) {
     daily = [],
     recentScans = [],
     recentTotals = {},
+    dbSize = { size_gb: 0 },
     jwt = { count: 0, tokens: [] },
     generatedAt = new Date()
   } = data;
@@ -1012,6 +1019,11 @@ function renderDashboardHTML(data) {
             <h2>Uptime &amp; Last Scan</h2>
             <div class="metric">${formatUptime(Number(stats.uptime_seconds || 0))}</div>
             <div class="hint">Last scan: ${formatTimestamp(stats.last_scan_at)}</div>
+          </div>
+          <div class="card">
+            <h2>Database Size</h2>
+            <div class="metric">${decimalFormatter.format(Number(dbSize.size_gb || 0))} GB</div>
+            <div class="hint">Total database size including indexes</div>
           </div>
         </section>
 

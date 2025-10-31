@@ -194,6 +194,48 @@ try {
   }
   
   success('Database tables initialized');
+  
+  // Step 5b: Create read-only user for website access
+  info('\nStep 5b: Creating read-only database user...');
+  try {
+    const readonlyPassword = process.env.DB_READONLY_PASSWORD || 'sora_readonly_password_change_me';
+    
+    // Create user (will skip if exists)
+    try {
+      await client.query(`CREATE USER sora_readonly WITH PASSWORD $1`, [readonlyPassword]);
+      log('  Created new user sora_readonly', 'cyan');
+    } catch (err) {
+      if (err.message.includes('already exists')) {
+        log('  User sora_readonly already exists, updating password...', 'yellow');
+        await client.query(`ALTER USER sora_readonly WITH PASSWORD $1`, [readonlyPassword]);
+      } else {
+        throw err;
+      }
+    }
+    
+    // Grant privileges
+    await client.query('GRANT CONNECT ON DATABASE ' + (process.env.DB_NAME || 'sora_feed') + ' TO sora_readonly');
+    await client.query('GRANT USAGE ON SCHEMA public TO sora_readonly');
+    await client.query('GRANT SELECT ON ALL TABLES IN SCHEMA public TO sora_readonly');
+    await client.query('GRANT SELECT ON ALL SEQUENCES IN SCHEMA public TO sora_readonly');
+    await client.query('ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO sora_readonly');
+    await client.query('ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON SEQUENCES TO sora_readonly');
+    await client.query('GRANT USAGE ON SCHEMA information_schema TO sora_readonly');
+    await client.query('GRANT USAGE ON SCHEMA pg_catalog TO sora_readonly');
+    
+    // Revoke write privileges (just to be safe)
+    await client.query('REVOKE INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER ON ALL TABLES IN SCHEMA public FROM sora_readonly');
+    await client.query('REVOKE CREATE ON SCHEMA public FROM sora_readonly');
+    
+    success('Read-only user sora_readonly created');
+    log(`  Username: sora_readonly`, 'cyan');
+    log(`  Password: ${readonlyPassword}`, 'cyan');
+    warning('  Change the password via: ALTER USER sora_readonly WITH PASSWORD \'your_secure_password\';');
+  } catch (err) {
+    warning(`Read-only user setup: ${err.message}`);
+    warning('You can create it manually using: scripts/create-readonly-user.sql');
+  }
+  
   client.release();
 } catch (err) {
   error(`Failed to initialize tables: ${err.message}`);

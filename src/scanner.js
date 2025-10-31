@@ -15,6 +15,11 @@ const pool = new Pool({
   connectionTimeoutMillis: 2000,
 });
 
+// Set timezone on database connections to Central Time
+pool.on('connect', async (client) => {
+  await client.query(`SET timezone = 'America/Chicago'`);
+});
+
 // Configuration
 const FETCH_LIMIT = 200;
 const MIN_POLL_INTERVAL = 6000;
@@ -27,7 +32,13 @@ const DASHBOARD_CACHE_TTL = 5000;
 const numberFormatter = new Intl.NumberFormat('en-US');
 const percentFormatter = new Intl.NumberFormat('en-US', { minimumFractionDigits: 1, maximumFractionDigits: 1 });
 const decimalFormatter = new Intl.NumberFormat('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-const dateTimeFormatter = new Intl.DateTimeFormat('en-US', { dateStyle: 'medium', timeStyle: 'medium' });
+// Set timezone to Central Time (America/Chicago)
+process.env.TZ = 'America/Chicago';
+const dateTimeFormatter = new Intl.DateTimeFormat('en-US', { 
+  dateStyle: 'medium', 
+  timeStyle: 'medium',
+  timeZone: 'America/Chicago'
+});
 
 // State
 let isScanning = false;

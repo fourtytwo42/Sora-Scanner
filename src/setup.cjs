@@ -107,8 +107,12 @@ const pool = new Pool({
 try {
   const client = await pool.connect();
   const version = await client.query('SELECT version()');
+  // Set timezone to Central Time
+  await client.query(`SET timezone = 'America/Chicago'`);
+  const tzCheck = await client.query("SELECT current_setting('timezone') AS tz");
   success('Database connection successful!');
   log(`  ${version.rows[0].version.split(' ').slice(0, 2).join(' ')}`, 'cyan');
+  log(`  Timezone: ${tzCheck.rows[0].tz}`, 'cyan');
   client.release();
 } catch (err) {
   error(`Database connection failed: ${err.message}`);

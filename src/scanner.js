@@ -70,9 +70,31 @@ async function ensureJwtTable() {
       id SERIAL PRIMARY KEY,
       token TEXT UNIQUE NOT NULL,
       expires_at TIMESTAMP NOT NULL,
-      added_at TIMESTAMP DEFAULT NOW()
+      added_at TIMESTAMP DEFAULT NOW(),
+      failure_count INTEGER DEFAULT 0,
+      first_failure_at TIMESTAMP,
+      last_failure_at TIMESTAMP,
+      last_success_at TIMESTAMP
     );
   `);
+  // Migrate existing table if needed (add failure tracking columns)
+  const migrations = [
+    { name: 'failure_count', type: 'INTEGER DEFAULT 0' },
+    { name: 'first_failure_at', type: 'TIMESTAMP' },
+    { name: 'last_failure_at', type: 'TIMESTAMP' },
+    { name: 'last_success_at', type: 'TIMESTAMP' }
+  ];
+  
+  for (const col of migrations) {
+    try {
+      await pool.query(`ALTER TABLE jwt_tokens ADD COLUMN ${col.name} ${col.type}`);
+    } catch (e) {
+      // Column already exists, ignore
+      if (!e.message.includes('already exists') && !e.message.includes('duplicate')) {
+        console.warn(`Warning adding column ${col.name}: ${e.message}`);
+      }
+    }
+  }
   await pool.query(`DELETE FROM jwt_tokens WHERE expires_at <= NOW()`);
 }
 
@@ -145,14 +167,26 @@ async function fetchSoraFeedRaw(limit = FETCH_LIMIT, bearerToken) {
       res.on('end', () => {
         try {
           if (res.statusCode === 401 || res.statusCode === 403) {
-            const err = new Error(`HTTP ${res.statusCode}`);
+            // Try to parse error message from response
+            let errorMessage = `HTTP ${res.statusCode}`;
+            try {
+              const json = JSON.parse(data);
+              if (json.error) {
+                const errorText = typeof json.error === 'string' ? json.error : JSON.stringify(json.error);
+                errorMessage = `HTTP ${res.statusCode}: ${errorText}`;
+              }
+            } catch (_) {
+              // If not JSON, use status code message
+            }
+            const err = new Error(errorMessage);
             err.statusCode = res.statusCode;
             reject(err);
             return;
           }
           const json = JSON.parse(data);
           if (json.error) {
-            const err = new Error(`API Error: ${JSON.stringify(json.error)}`);
+            const errorText = typeof json.error === 'string' ? json.error : JSON.stringify(json.error);
+            const err = new Error(`API Error: ${errorText}`);
             err.statusCode = res.statusCode || 500;
             reject(err);
             return;
@@ -176,6 +210,112 @@ async function fetchSoraFeedRaw(limit = FETCH_LIMIT, bearerToken) {
   });
 }
 
+// Check if error indicates actual token invalidation (not just a temporary issue)
+function isTokenInvalidationError(error) {
+  if (!error) return false;
+  
+  const message = String(error.message || '').toLowerCase();
+  
+  // Specific patterns that indicate actual token invalidation
+  // Only these specific messages should trigger invalidation tracking
+  const invalidationPatterns = [
+    /jwt.*has been invalidated/i,
+    /token.*has been invalidated/i,
+    /jwt.*been invalidated/i,
+    /token.*been invalidated/i,
+    /token.*revoked/i,
+    /jwt.*revoked/i,
+    /authentication.*failed.*token/i,
+    /invalid.*token/i,
+    /token.*expired/i,
+    /unauthorized.*token/i
+  ];
+  
+  // Must have both a 401/403 status AND a clear invalidation message
+  // This prevents false positives from network issues, rate limits, etc.
+  const is401or403 = error.statusCode === 401 || error.statusCode === 403;
+  const hasInvalidationMessage = invalidationPatterns.some(pattern => pattern.test(message));
+  
+  // Only treat as invalidation if we have both conditions
+  // This is conservative to avoid false positives
+  return is401or403 && hasInvalidationMessage;
+}
+
+// Record token failure and check if should be deleted
+async function recordTokenFailure(tokenId, error) {
+  if (!tokenId) return false; // Skip env token
+  
+  const isInvalidation = isTokenInvalidationError(error);
+  const now = new Date();
+  
+  // Get current failure info
+  const result = await pool.query(
+    `SELECT failure_count, first_failure_at, last_failure_at FROM jwt_tokens WHERE id = $1`,
+    [tokenId]
+  );
+  
+  if (result.rows.length === 0) return false;
+  
+  const current = result.rows[0];
+  
+  // Only increment failure count if this is an actual invalidation error
+  // Network issues, rate limits, etc. won't count toward deletion
+  let failureCount = current.failure_count || 0;
+  let firstFailure = current.first_failure_at ? new Date(current.first_failure_at) : null;
+  
+  if (isInvalidation) {
+    failureCount = failureCount + 1;
+    if (!firstFailure) {
+      firstFailure = now;
+    }
+    
+    // Update failure tracking (only for invalidation errors)
+    await pool.query(`
+      UPDATE jwt_tokens 
+      SET failure_count = $1,
+          first_failure_at = COALESCE(first_failure_at, $2),
+          last_failure_at = $2
+      WHERE id = $3
+    `, [failureCount, now, tokenId]);
+    
+    // Only delete if:
+    // 1. Error indicates actual invalidation (already checked)
+    // 2. Has failed 3+ times
+    // 3. Failures happened within last 30 minutes (not spread out over days)
+    const timeWindow = 30 * 60 * 1000; // 30 minutes
+    const timeSinceFirstFailure = now.getTime() - firstFailure.getTime();
+    const shouldDelete = failureCount >= 3 && timeSinceFirstFailure < timeWindow;
+    
+    if (shouldDelete) {
+      await pool.query(`DELETE FROM jwt_tokens WHERE id = $1`, [tokenId]);
+      console.warn(`🗑️  Removed invalid token id=${tokenId} after ${failureCount} invalidation errors within ${Math.round(timeSinceFirstFailure / 1000 / 60)} minutes`);
+      tokenCache = null;
+      return true;
+    } else {
+      console.warn(`⚠️  Token id=${tokenId} invalidation error (${failureCount}/3) - ${error.message.substring(0, 100)}`);
+    }
+  } else {
+    // For non-invalidation errors (network issues, rate limits, etc.), just log but don't track
+    console.warn(`⚠️  Token id=${tokenId} failed (not invalidation, will retry): ${error.message.substring(0, 100)}`);
+  }
+  
+  return false;
+}
+
+// Reset failure count on successful token use
+async function recordTokenSuccess(tokenId) {
+  if (!tokenId) return; // Skip env token
+  
+  await pool.query(`
+    UPDATE jwt_tokens 
+    SET failure_count = 0,
+        first_failure_at = NULL,
+        last_failure_at = NULL,
+        last_success_at = NOW()
+    WHERE id = $1
+  `, [tokenId]);
+}
+
 // High-level fetch that rotates tokens and fails over
 async function fetchSoraFeed(limit = FETCH_LIMIT) {
   // Load tokens from DB; if none, fall back to env
@@ -192,14 +332,18 @@ async function fetchSoraFeed(limit = FETCH_LIMIT) {
   let lastError = null;
   for (const c of candidates) {
     try {
-      return await fetchSoraFeedRaw(limit, c.token);
+      const result = await fetchSoraFeedRaw(limit, c.token);
+      // On success, reset failure count
+      if (c.id) {
+        await recordTokenSuccess(c.id);
+      }
+      return result;
     } catch (e) {
       lastError = e;
-      // If unauthorized/invalid, remove and try next
+      // Record failure but only delete after multiple failures with invalidation errors
       if (e && (e.statusCode === 401 || e.statusCode === 403 || /invalid token|jwt/i.test(e.message))) {
         if (c.id) {
-          await removeTokenById(c.id);
-          console.warn(`🔁 Removed invalid token id=${c.id}, trying next`);
+          await recordTokenFailure(c.id, e);
         }
         continue;
       }
